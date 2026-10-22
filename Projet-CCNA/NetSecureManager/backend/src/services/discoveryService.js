@@ -1,0 +1,2237 @@
+/**
+ * discoveryService.js
+ * Moteur de découverte réseau : scanne une plage CIDR, détecte les hôtes actifs,
+ * et interroge chacun en SNMP pour identifier son type/fabricant sans configuration
+ * manuelle préalable de la part de l'utilisateur.
+ *
+ * Dépendances : npm install ping net-snmp ip
+ */
+
+const ping = require("ping");
+const snmp = require("net-snmp");
+// Arithmétique d'adresses écrite dans le projet : voir adressesIp.js pour
+// la raison du remplacement du paquet « ip ».
+const ipLib = require("./adressesIp");
+const net = require("net");
+const dgram = require("dgram");
+const os = require("os");
+const { exec, execFile } = require("child_process");
+const { chargerRegistre, resoudreAvecRegistre } = require("./ouiService");
+const { determinerType, typeDepuisTexte } = require("./typeService");
+const { resoudreNom } = require("./nomService");
+const { parLots } = require("./parLots");
+const { lireBanniere } = require("./banniereWebService");
+const { identifierVersions } = require("./versionService");
+const { examinerCertificats } = require("./certificatService");
+
+const OID_SYS_DESCR = "1.3.6.1.2.1.1.1.0";
+const OID_SYS_OBJECT_ID = "1.3.6.1.2.1.1.2.0";
+const OID_SYS_NAME = "1.3.6.1.2.1.1.5.0";
+const OID_SYS_UPTIME = "1.3.6.1.2.1.1.3.0";
+/* ═══════════════════════════════════════════════════════════════════════
+   LES SERVICES QUE LE SCAN SAIT NOMMER
+
+   Un port ouvert répond à deux questions à la fois : QU'EST-CE QUE CETTE
+   MACHINE (une imprimante expose 9100, un autocommutateur expose 5060),
+   et QU'EST-CE QU'ELLE EXPOSE (un Telnet ouvert en 2026 est un problème
+   en soi).
+
+   ── CE QUE COÛTE CHAQUE PORT AJOUTÉ ──
+
+   `scanPorts` teste tous les ports d'une machine EN PARALLÈLE, mais une
+   machine muette fait expirer chaque tentative. Le coût réel se compte
+   donc en sockets ouverts simultanément, pas en temps : sur un /24 de
+   soixante machines vivantes, passer de dix-neuf à trente-sept ports
+   double le nombre de connexions.
+
+   Chaque ligne ci-dessous doit donc gagner sa place : soit elle NOMME un
+   service qu'on trouve réellement dans une PME, soit elle permet de
+   classer une machine, soit elle signale un risque. Un port « au cas
+   où » n'a rien à faire ici.
+   ═══════════════════════════════════════════════════════════════════════ */
+const PORTS_COURANTS = {
+  /* ── Les classiques ── */
+  21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
+  80: "HTTP", 110: "POP3", 143: "IMAP", 161: "SNMP", 443: "HTTPS",
+  445: "SMB", 3306: "MySQL", 3389: "RDP", 5432: "PostgreSQL", 8080: "HTTP-alt",
+
+  /* ── Impression et vidéo ──
+     Quasi mono-usage : ils classent un équipement muet en SNMP comme en
+     nmap, ce qu'aucune autre source ne sait faire. */
+  515: "LPD", 554: "RTSP", 631: "IPP", 9100: "JetDirect",
+
+  /* ── Windows et domaine ──
+     88 et 389 ouverts ensemble, c'est un contrôleur de domaine : sur un
+     réseau d'entreprise, c'est la machine la plus importante à connaître
+     et elle ne se présente nulle part comme telle.
+     135 et 139 complètent 445 : un poste Windows dont le partage de
+     fichiers est fermé reste visible par eux. */
+  88: "Kerberos", 135: "RPC Windows", 139: "NetBIOS",
+  389: "LDAP", 636: "LDAPS",
+  5985: "WinRM", 5986: "WinRM (TLS)",
+
+  /* ── Bases de données ──
+     Une base exposée au réseau local est une information de sécurité
+     autant que d'inventaire. */
+  1433: "SQL Server", 1521: "Oracle", 6379: "Redis", 27017: "MongoDB",
+
+  /* ── Prise de contrôle à distance ──
+     VNC en clair sur un réseau de bureau mérite d'être vu. */
+  5900: "VNC",
+
+  /* ── Stockage et partage ── */
+  2049: "NFS", 548: "AFP", 5001: "Synology DSM",
+
+  /* ── Virtualisation ──
+     Un hyperviseur porte des dizaines de machines : le rater, c'est
+     rater tout ce qu'il héberge. */
+  902: "VMware ESXi", 8006: "Proxmox",
+
+  /* ── Téléphonie ──
+     SIP est mono-usage : ce qui l'expose est un téléphone ou un
+     autocommutateur, jamais autre chose. */
+  5060: "SIP", 5061: "SIP (TLS)",
+
+  /* ── Administration web ──
+     Beaucoup d'équipements réseau n'exposent leur interface que là. */
+  8443: "HTTPS-alt",
+
+  /* ── Objets connectés et industriel ──
+     Rares en PME de bureau, décisifs quand ils sont là : une machine qui
+     parle Modbus pilote quelque chose de physique. */
+  1883: "MQTT", 502: "Modbus",
+};
+
+/**
+ * Vrai si le dernier octet vaut 0 ou 255.
+ *
+ * POURQUOI CES DEUX-LÀ SONT ÉCARTÉES.
+ *
+ * Sur un parc réel, l'adresse 192.168.0.255 s'est retrouvée enregistrée
+ * comme un équipement, puis a généré une alerte « ne répond plus »
+ * permanente. Ce n'est pas une machine : c'est l'adresse de DIFFUSION
+ * du bloc 192.168.0.x.
+ *
+ * Le mécanisme : la plage scannée était un /23, où 192.168.0.255 est
+ * techniquement une adresse d'hôte valide. Mais les postes du réseau,
+ * eux, sont configurés en /24 — comme la quasi-totalité du matériel. Ils
+ * la traitent donc comme une diffusion et répondent au ping. Cette
+ * réponse ne vient d'aucun appareil situé à cette adresse : c'est un
+ * écho collectif.
+ *
+ * L'équipement fantôme ainsi créé ne répond plus au balayage suivant, et
+ * alerte indéfiniment. Un outil de supervision qui invente des pannes
+ * perd sa raison d'être.
+ *
+ * CE QU'ON PERD. Sur un /23 ou plus large, une machine peut légitimement
+ * porter une adresse en .0 ou .255. Elle ne sera pas découverte. C'est
+ * assumé : cette configuration est rare et déconseillée précisément
+ * parce qu'elle perturbe les équipements en /24, alors que le faux
+ * positif, lui, se produit sur presque tous les réseaux.
+ */
+function estAdresseReservee(ip) {
+  const dernier = Number(String(ip).split(".")[3]);
+  return dernier === 0 || dernier === 255;
+}
+
+/**
+ * Sous-réseaux auxquels ce serveur est directement raccordé.
+ *
+ * Les interfaces virtuelles ne sont pas écartées ici : sur un poste de
+ * développement elles sont nombreuses (Hyper-V, WSL, VMware), mais elles
+ * désignent de vrais réseaux joignables. La distinction utile est faite
+ * par l'appelant.
+ *
+ * @param {object} [interfaces] injectable pour les tests
+ */
+function sousReseauxLocaux(interfaces) {
+  const cartes = interfaces || os.networkInterfaces();
+  const liste = [];
+  for (const groupe of Object.values(cartes || {})) {
+    for (const c of groupe || []) {
+      // Node renvoie "IPv4" selon les versions, 4 selon d'autres.
+      if (c.family !== "IPv4" && c.family !== 4) continue;
+      if (c.internal || !c.address) continue;
+      liste.push(c.address);
+    }
+  }
+  return liste;
+}
+
+/** Vrai si ce serveur possède une adresse à l'intérieur de la plage. */
+function estDirectementAttache(cidr, adressesLocales) {
+  try {
+    const sous = ipLib.cidrSubnet(cidr);
+    return adressesLocales.some((a) => sous.contains(a));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Une plage sans équipement est-elle vide, ou hors de portée ?
+ *
+ * Les deux cas rendent zéro machine et sont indiscernables dans le
+ * résultat d'un scan. C'est le trou le plus coûteux d'un inventaire : un
+ * VLAN inatteignable ressemble trait pour trait à un VLAN vide, et le
+ * client croit son parc complet.
+ *
+ * Le seul signal utile est le RACCORDEMENT, et il ne coûte aucun paquet.
+ * Une première version repinguait la passerelle probable ; c'était inutile,
+ * puisque `scanRange` vient de pinguer TOUTES les adresses de la plage, y
+ * compris celle-là. Reposer la question ne pouvait rien apprendre.
+ *
+ * Si le serveur possède une adresse dans la plage, le réseau lui est
+ * directement raccordé : zéro machine signifie alors réellement zéro
+ * machine. Sinon, l'atteindre suppose un routage qu'on n'a aucun moyen de
+ * vérifier depuis ici — et l'absence totale de réponse s'explique alors
+ * bien plus souvent par une route absente que par un réseau désert.
+ *
+ * Le verdict négatif reste un DOUTE : un VLAN routé et réellement vide
+ * donne le même résultat. Le message le formule comme tel.
+ *
+ * @returns {{joignable: boolean|null, raison: string}}
+ */
+function diagnostiquerPortee(cidr) {
+  try {
+    ipLib.cidrSubnet(cidr);
+  } catch {
+    return { joignable: null, raison: "plage illisible" };
+  }
+
+  if (estDirectementAttache(cidr, sousReseauxLocaux())) {
+    return {
+      joignable: true,
+      raison: "réseau directement raccordé à ce serveur : il est réellement vide",
+    };
+  }
+
+  return {
+    joignable: false,
+    raison:
+      "aucune machine n'a répondu et ce réseau n'est pas raccordé à ce " +
+      "serveur. L'absence de route ou un pare-feu entre VLAN est le cas le " +
+      "plus fréquent : il faut alors un agent local sur ce réseau.",
+  };
+}
+
+/**
+ * Nombre maximal d'adresses qu'une plage a le droit de contenir.
+ *
+ * POURQUOI CE PLAFOND. `listHostsFromCidr` construisait la liste complète
+ * des adresses SANS AUCUNE BORNE. Une plage saisie « 10.0.0.0/8 » — une
+ * faute de frappe courante, /8 au lieu de /24 — demandait un tableau de
+ * 16,7 millions de chaînes : le processus Node dépassait la mémoire
+ * disponible et TOUTE la supervision tombait, y compris pour les autres
+ * sites. Aucun message n'aurait désigné la cause.
+ *
+ * 65 534 adresses (/16) laisse passer tout réseau d'entreprise réel tout
+ * en écartant les saisies catastrophiques. Relevable par SCAN_MAX_HOTES
+ * pour un cas particulier, mais un scan de cette taille se découpe en
+ * plusieurs plages : c'est plus rapide et cela dit où l'on en est.
+ */
+const MAX_HOTES_PAR_PLAGE = Number(process.env.SCAN_MAX_HOTES) > 0
+  ? Number(process.env.SCAN_MAX_HOTES)
+  : 65534;
+
+function listHostsFromCidr(cidr) {
+  if (typeof cidr !== "string" || !/^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(cidr.trim())) {
+    throw new Error(
+      `Plage réseau illisible : « ${cidr} ». Attendu : une adresse et un masque, par exemple 192.168.1.0/24.`
+    );
+  }
+
+  const subnet = ipLib.cidrSubnet(cidr.trim());
+
+  // Compté AVANT de construire quoi que ce soit : le but est justement de
+  // ne pas allouer le tableau qui ferait tomber le serveur.
+  const taille = ipLib.toLong(subnet.lastAddress) - ipLib.toLong(subnet.firstAddress) + 1;
+  if (taille > MAX_HOTES_PAR_PLAGE) {
+    throw new Error(
+      `Plage trop large : ${cidr} contient ${taille.toLocaleString("fr-FR")} adresses, ` +
+        `la limite est de ${MAX_HOTES_PAR_PLAGE.toLocaleString("fr-FR")}. ` +
+        `Découpez-la en plusieurs plages (un /24 par VLAN est l'usage), ` +
+        `ou relevez SCAN_MAX_HOTES dans backend/.env si c'est réellement voulu.`
+    );
+  }
+
+  const hosts = [];
+  const start = ipLib.toLong(subnet.firstAddress);
+  const end = ipLib.toLong(subnet.lastAddress);
+  for (let i = start; i <= end; i++) {
+    const ip = ipLib.fromLong(i);
+    // firstAddress/lastAddress écartent déjà le réseau et la diffusion
+    // de la plage SCANNÉE. Restent ceux des blocs /24 intermédiaires,
+    // qui sont ceux qui posent problème.
+    if (estAdresseReservee(ip)) continue;
+    hosts.push(ip);
+  }
+  return hosts;
+}
+
+/**
+ * Compare deux adresses matérielles sans se soucier de leur écriture.
+ * « A4-BB-6D-01-02-03 » et « a4:bb:6d:01:02:03 » désignent la même carte ;
+ * les comparer telles quelles conclurait à un changement de machine et
+ * relancerait une identification complète à chaque scan.
+ */
+function normaliserMacSimple(mac) {
+  if (!mac) return null;
+  const propre = String(mac).toLowerCase().replace(/[^0-9a-f]/g, "");
+  return propre.length === 12 ? propre : null;
+}
+
+/**
+ * Balayage ICMP.
+ *
+ * CONCURRENCE À 64, ET NON 30.
+ *
+ * Sur un /23, 508 adresses à 30 en parallèle font dix-sept vagues d'une
+ * seconde : dix-sept secondes rien que pour savoir qui répond, avant même
+ * d'avoir identifié une seule machine.
+ *
+ * Un ping n'est pas un scan de ports : c'est un paquet, une réponse,
+ * aucune connexion ouverte, rien qui ressemble à une reconnaissance
+ * hostile. La borne prudente de cinq machines simultanées vaut pour
+ * l'identification — SNMP, nmap, ports — pas pour le balayage.
+ *
+ * Réglable par PING_CONCURRENCE, plafonné à 128.
+ */
+const CONCURRENCE_PING = (() => {
+  const v = Number(process.env.PING_CONCURRENCE);
+  return Number.isFinite(v) && v > 0 ? Math.min(128, Math.floor(v)) : 64;
+})();
+
+async function pingSweep(hosts, concurrency = CONCURRENCE_PING) {
+  const alive = [];
+  for (let i = 0; i < hosts.length; i += concurrency) {
+    const batch = hosts.slice(i, i + concurrency);
+    // Un ping qui rejette ne doit pas annuler tout le lot : on neutralise l'échec.
+    const results = await Promise.all(
+      batch.map((ip) =>
+        ping.promise.probe(ip, { timeout: 1 }).catch(() => ({ alive: false, host: ip }))
+      )
+    );
+    results.forEach((r) => {
+      if (r && r.alive) alive.push({ ip: r.host, latency: r.time });
+    });
+  }
+  return alive;
+}
+
+function snmpProbe(ip, community = "public", timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    const session = snmp.createSession(ip, community, { timeout: timeoutMs, retries: 0 });
+    const oids = [OID_SYS_DESCR, OID_SYS_OBJECT_ID, OID_SYS_NAME, OID_SYS_UPTIME];
+
+    session.get(oids, (error, varbinds) => {
+      session.close();
+      if (error) return resolve(null);
+      const result = {};
+      varbinds.forEach((vb, idx) => {
+        if (!snmp.isVarbindError(vb)) {
+          const key = ["sysDescr", "sysObjectID", "sysName", "sysUptime"][idx];
+          result[key] = vb.value.toString();
+        }
+      });
+      resolve(result);
+    });
+
+    session.on("error", () => resolve(null));
+  });
+}
+
+/**
+ * Interrogation SNMPv3, avec authentification (et chiffrement optionnel).
+ */
+function snmpProbeV3(ip, { username, authKey, authProtocol = "SHA", privKey, privProtocol }, timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    const options = {
+      port: 161,
+      retries: 0,
+      timeout: timeoutMs,
+      version: snmp.Version3,
+    };
+
+    const authProtocolMap = { MD5: snmp.AuthProtocols.md5, SHA: snmp.AuthProtocols.sha };
+    const privProtocolMap = { DES: snmp.PrivProtocols.des, AES: snmp.PrivProtocols.aes };
+
+    const user = {
+      name: username,
+      level: privKey ? snmp.SecurityLevel.authPriv : snmp.SecurityLevel.authNoPriv,
+      authProtocol: authProtocolMap[authProtocol] || snmp.AuthProtocols.sha,
+      authKey,
+    };
+    if (privKey) {
+      user.privProtocol = privProtocolMap[privProtocol] || snmp.PrivProtocols.des;
+      user.privKey = privKey;
+    }
+
+    const session = snmp.createV3Session(ip, user, options);
+    const oids = [OID_SYS_DESCR, OID_SYS_OBJECT_ID, OID_SYS_NAME, OID_SYS_UPTIME];
+
+    session.get(oids, (error, varbinds) => {
+      session.close();
+      if (error) return resolve(null);
+      const result = {};
+      varbinds.forEach((vb, idx) => {
+        if (!snmp.isVarbindError(vb)) {
+          const key = ["sysDescr", "sysObjectID", "sysName", "sysUptime"][idx];
+          result[key] = vb.value.toString();
+        }
+      });
+      resolve(result);
+    });
+
+    session.on("error", () => resolve(null));
+  });
+}
+function fingerprint(snmpData) {
+  if (!snmpData) {
+    return { type: "inconnu", fabricant: null };
+  }
+
+  const descr = (snmpData.sysDescr || "").toLowerCase();
+  const nom = (snmpData.sysName || "").toLowerCase();
+  const texte = `${descr} ${nom}`;
+
+  // Réseau / infrastructure
+  if (texte.includes("cisco")) return { type: "routeur/switch", fabricant: "Cisco" };
+  if (texte.includes("huawei")) return { type: "routeur/switch", fabricant: "Huawei" };
+  if (texte.includes("juniper")) return { type: "routeur", fabricant: "Juniper" };
+  if (texte.includes("mikrotik")) return { type: "routeur", fabricant: "Mikrotik" };
+  if (texte.includes("ubiquiti") || texte.includes("unifi")) return { type: "routeur/switch", fabricant: "Ubiquiti" };
+  if (texte.includes("aruba")) return { type: "routeur/switch", fabricant: "Aruba (HPE)" };
+  if (texte.includes("fortinet") || texte.includes("fortigate")) return { type: "pare-feu", fabricant: "Fortinet" };
+  if (texte.includes("d-link")) return { type: "routeur/switch", fabricant: "D-Link" };
+  if (texte.includes("tp-link")) return { type: "routeur/switch", fabricant: "TP-Link" };
+  if (texte.includes("netgear")) return { type: "routeur/switch", fabricant: "Netgear" };
+
+  // Serveurs / postes
+  if (texte.includes("windows")) return { type: "serveur", fabricant: "Microsoft" };
+  if (texte.includes("linux")) return { type: "serveur", fabricant: "Linux" };
+  if (texte.includes("vmware") || texte.includes("esxi")) return { type: "serveur", fabricant: "VMware" };
+
+  // Imprimantes — reconnaît aussi les noms d'hôte génériques type NPIxxxxx (HP)
+  if (texte.includes("printer") || texte.includes("laserjet") || texte.includes("hp jetdirect"))
+    return { type: "imprimante", fabricant: "HP" };
+  if (texte.includes("npi") || texte.includes("jetdirect"))
+    return { type: "imprimante", fabricant: "HP" };
+  if (texte.includes("xerox")) return { type: "imprimante", fabricant: "Xerox" };
+  if (texte.includes("epson")) return { type: "imprimante", fabricant: "Epson" };
+  if (texte.includes("brother")) return { type: "imprimante", fabricant: "Brother" };
+  if (texte.includes("canon")) return { type: "imprimante", fabricant: "Canon" };
+  if (texte.includes("kyocera")) return { type: "imprimante", fabricant: "Kyocera" };
+  if (texte.includes("ricoh")) return { type: "imprimante", fabricant: "Ricoh" };
+  if (texte.includes("konica") || texte.includes("minolta")) return { type: "imprimante", fabricant: "Konica Minolta" };
+  if (texte.includes("lexmark")) return { type: "imprimante", fabricant: "Lexmark" };
+
+  // Téléphonie IP / caméras
+  if (texte.includes("axis")) return { type: "camera", fabricant: "Axis" };
+  if (texte.includes("hikvision")) return { type: "camera", fabricant: "Hikvision" };
+  if (texte.includes("polycom") || texte.includes("yealink")) return { type: "telephonie", fabricant: "VoIP" };
+
+  if (!descr) return { type: "inconnu", fabricant: null };
+  return { type: "equipement_snmp", fabricant: "inconnu" };
+}
+
+function fabricantFromOsString(osString) {
+  if (!osString) return null;
+  const s = osString.toLowerCase();
+  if (s.includes("windows") || s.includes("microsoft")) return "Microsoft";
+  if (s.includes("android")) return "Google (Android)";
+  if (s.includes("linux")) return "Linux";
+  if (s.includes("ios") || s.includes("mac os") || s.includes("apple")) return "Apple";
+  if (s.includes("cisco")) return "Cisco";
+  return null;
+}
+
+/**
+ * Détection d'OS via nmap (signature TCP/IP), complémentaire à SNMP.
+ * Nécessite nmap installé, et des droits administrateur sous Windows.
+ *
+ * nmap représente 93 % du temps d'un scan. Chaque option a été mesurée
+ * séparément sur des machines réelles ; seules celles qui accélèrent sans
+ * rien perdre sont retenues.
+ *
+ *   -F              retenue : 15 % plus rapide, aucune détection perdue.
+ *                   `-O` déduit le système d'un port ouvert et d'un port
+ *                   fermé, que les 100 ports usuels fournissent déjà.
+ *   -T4, -n,        écartées : gain non mesurable (1 à 2 %), donc du
+ *   --max-retries   risque sans contrepartie.
+ *
+ * `--host-timeout` est réglé très au-dessus du besoin observé (15,5 s au
+ * maximum mesuré). Une première tentative à 12 s perdait la détection sur
+ * trois machines qui en demandaient 14 : le réglage censé faire gagner du
+ * temps transformait des succès en échecs. À 25 s, il n'abrège que les
+ * machines qui n'auraient rien donné.
+ *
+ * Le délai Node reste au-dessus de celui de nmap, délibérément : nmap
+ * s'arrête alors lui-même et restitue ce qu'il a trouvé, au lieu d'être
+ * tué et de ne rien rendre après avoir fait attendre.
+ */
+const NMAP_DELAI_HOTE_S = 25;
+
+function nmapFingerprint(ip, timeoutMs = 30000) {
+  return new Promise((resolve) => {
+    exec(
+      `nmap -O --osscan-guess -F --host-timeout ${NMAP_DELAI_HOTE_S}s ${ip}`,
+      { timeout: timeoutMs },
+      (error, stdout) => {
+        // On analyse la sortie DÈS QU'ELLE EXISTE, même en cas d'erreur.
+        // nmap sort en code non nul dans plusieurs cas bénins (hôte
+        // partiellement analysé, avertissement) tout en ayant déjà imprimé
+        // l'empreinte. L'ancienne version jetait ce résultat.
+        if (!stdout) return resolve(null);
+        void error;
+
+        const matchOs =
+          stdout.match(/OS details: (.+)/) || stdout.match(/Aggressive OS guesses: (.+)/);
+        const matchDevice = stdout.match(/Device type: (.+)/);
+
+        if (!matchOs) return resolve(null);
+        resolve({
+          os_detecte: matchOs[1].split(",")[0].trim(),
+          type_detecte: matchDevice ? matchDevice[1].trim() : null,
+        });
+      }
+    );
+  });
+}
+
+/**
+ * Envoie un paquet magique Wake-on-LAN en broadcast UDP sur le réseau local.
+ * Ne fonctionne que si la machine cible a le WoL activé (BIOS + carte réseau)
+ * et si elle est sur le même segment réseau que le serveur qui envoie ceci.
+ */
+function wakeOnLan(macAddress) {
+  return new Promise((resolve, reject) => {
+    const mac = macAddress.replace(/[:-]/g, "");
+    if (mac.length !== 12) {
+      return reject(new Error("Adresse MAC invalide"));
+    }
+
+    const macBuffer = Buffer.from(mac, "hex");
+    const magicPacket = Buffer.concat([
+      Buffer.alloc(6, 0xff),
+      Buffer.concat(Array(16).fill(macBuffer)),
+    ]);
+
+    const socket = dgram.createSocket("udp4");
+    socket.on("error", (err) => {
+      socket.close();
+      reject(err);
+    });
+
+    socket.bind(() => {
+      socket.setBroadcast(true);
+      socket.send(magicPacket, 0, magicPacket.length, 9, "255.255.255.255", (err) => {
+        socket.close();
+        if (err) reject(err);
+        else resolve(true);
+      });
+    });
+  });
+}
+
+/**
+ * Lit la table ARP du système d'exploitation (remplie automatiquement par
+ * Windows/Linux dès qu'une communication locale a eu lieu). Complète le ping
+ * pour détecter des appareils qui bloquent l'ICMP mais existent bien sur le
+ * réseau local.
+ */
+function readArpTable() {
+  return new Promise((resolve) => {
+    exec("arp -a", (error, stdout) => {
+      if (error) return resolve([]);
+
+      const entries = [];
+      const lines = stdout.split("\n");
+      for (const line of lines) {
+        const match = line.trim().match(/^(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F-]{17})\s+(\w+)/);
+        if (match && match[2].toLowerCase() !== "ff-ff-ff-ff-ff-ff") {
+          entries.push({ ip: match[1], mac: match[2], type: match[3] });
+        }
+      }
+      resolve(entries);
+    });
+  });
+}
+
+/**
+ * Croise le résultat du ping sweep avec la table ARP : ajoute les appareils
+ * vus en ARP mais absents du ping (probablement un pare-feu qui bloque ICMP).
+ */
+async function arpComplement(cidr, aliveHostsFromPing, arpEntries = null) {
+  // arpEntries peut être fourni par l'appelant pour éviter de relire la table ARP.
+  const entrees = arpEntries || (await readArpTable());
+  const ipsDejaVues = new Set(aliveHostsFromPing.map((h) => h.ip));
+
+  // Test d'appartenance réel au sous-réseau : le test par préfixe sur les
+  // 3 premiers octets était faux pour tout masque autre que /24 (ex: /23).
+  const subnet = ipLib.cidrSubnet(cidr);
+  const complements = entrees.filter(
+    (e) => subnet.contains(e.ip) && !ipsDejaVues.has(e.ip)
+  );
+
+  return complements.map((e) => ({ ip: e.ip, mac: e.mac, viaArp: true }));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   LE BALAYAGE PAR NMAP — POURQUOI IL EST MEILLEUR, ET QUAND IL S'APPLIQUE
+
+   CE QUE LE BALAYAGE MAISON NE PEUT PAS FAIRE. Il envoie un ping ICMP,
+   puis complète en lisant le cache ARP du système. Deux faiblesses
+   structurelles : un poste Windows ne répond pas au ping par défaut, et
+   un cache est un SOUVENIR — il contient des machines parties depuis
+   plusieurs minutes.
+
+   Émettre soi-même une requête ARP réglerait les deux d'un coup : à la
+   couche 2, aucune machine du segment ne peut se taire, et la réponse
+   est du présent, pas du souvenir. Mais forger une trame ARP demande un
+   accès aux paquets bruts, donc des droits d'administrateur et une
+   dépendance native. Node ne le fait pas.
+
+   NMAP, LUI, LE FAIT — ET IL EST DÉJÀ LÀ. Cette plateforme l'appelle
+   depuis longtemps pour l'empreinte de système (voir nmapFingerprint).
+   Le même binaire sait balayer un réseau entier en ARP. Mesuré sur le
+   parc de test : 239 adresses en 2,9 secondes, là où le ping sweep
+   demande plusieurs minutes et rate les postes pare-feutés.
+
+   CE QU'ON LUI DEMANDE, ET CE QU'ON NE LUI DEMANDE PAS.
+
+     -sn   découverte seule : aucun port n'est scanné. Le scan de ports
+           reste le nôtre, ciblé et discret.
+     -n    pas de résolution DNS : la plateforme a son propre nommage à
+           cinq sources, et la résolution de nmap coûterait une seconde
+           et demie pour un résultat moins bon.
+
+   Nmap choisit l'ARP de lui-même quand la cible est sur le segment
+   local ET qu'il a les droits nécessaires. On ne force donc pas `-PR` :
+   sur un site distant il n'aurait aucun sens, et nmap sait mieux que
+   nous ce qui s'applique.
+
+   TROIS REPLIS, ET AUCUN N'INTERROMPT LE SCAN. Nmap absent, nmap sans
+   droits suffisants, nmap qui ne rend rien : dans les trois cas on
+   revient au balayage maison, exactement comme avant. La console dit
+   laquelle des deux méthodes a servi — une mesure dont on ignore la
+   provenance ne vaut pas mieux qu'une supposition.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Lit la sortie de `nmap -sn`. Fonction PURE, donc vérifiable sans réseau.
+ *
+ * Nmap n'imprime que les machines VIVANTES quand on ne lui demande pas
+ * de détail — une adresse absente de la sortie est une adresse muette.
+ * La ligne « MAC Address » n'apparaît que si la découverte a eu lieu en
+ * ARP : sa présence est donc la preuve que nmap a bien travaillé à la
+ * couche 2, et pas en repli TCP faute de droits.
+ */
+function lireBalayageNmap(sortie) {
+  const hotes = [];
+  let courant = null;
+
+  for (const ligne of String(sortie || "").split("\n")) {
+    const rapport = ligne.match(/^Nmap scan report for (?:\S+ \()?(\d+\.\d+\.\d+\.\d+)\)?/);
+    if (rapport) {
+      // Une adresse explicitement annoncée éteinte n'entre pas.
+      if (/\[host down\]/i.test(ligne)) {
+        courant = null;
+        continue;
+      }
+      courant = { ip: rapport[1], latency: null, mac: null };
+      hotes.push(courant);
+      continue;
+    }
+    if (!courant) continue;
+
+    const vivant = ligne.match(/^Host is up(?: \(([\d.]+)s latency\))?/);
+    if (vivant) {
+      courant.latency = vivant[1] ? Math.round(Number(vivant[1]) * 1000) : null;
+      continue;
+    }
+
+    const mac = ligne.match(/^MAC Address: ([0-9A-Fa-f:]{17})/);
+    if (mac) courant.mac = mac[1].toUpperCase();
+  }
+
+  return hotes;
+}
+
+/**
+ * Balaye un réseau avec nmap. Rend `null` — et non un tableau vide — si
+ * nmap n'a pas pu travailler : l'appelant doit distinguer « nmap dit
+ * qu'il n'y a personne » de « nmap n'a rien pu dire », et retomber sur
+ * le balayage maison dans le second cas seulement.
+ */
+function balayageNmap(cidr, nbAdresses, exclusions = []) {
+  return new Promise((resolve) => {
+    /* Le délai suit la taille du réseau. Mesure de référence : 239
+       adresses en 2,9 s. On accorde très large — vingt fois la mesure —
+       parce qu'un réseau chargé ralentit nmap, et qu'un délai trop court
+       transformerait un succès lent en repli inutile. */
+    const delaiMs = Math.min(300_000, 20_000 + nbAdresses * 250);
+
+    /* ── LES ZONES EXCLUES NE SONT PAS SONDÉES, PAS « FILTRÉES APRÈS » ──
+
+       Écarter les résultats après coup aurait laissé nmap envoyer ses
+       paquets : pour un automate industriel ou un équipement médical,
+       c'est précisément ce qu'on nous demande d'éviter. `--exclude` le
+       dit à nmap AVANT qu'il ne touche à quoi que ce soit.
+
+       Le format accepté est « 192.168.0.100-200 » pour un intervalle
+       dans le même /24, sinon la liste des adresses. On borne la liste
+       pour ne pas fabriquer une ligne de commande interminable ; au-delà,
+       l'exclusion reste appliquée par notre propre filtrage, qui, lui,
+       n'envoie rien du tout. */
+    const arg = exclusions.length > 0 ? ` --exclude ${exclusions.join(",")}` : "";
+
+    exec(
+      `nmap -sn -n${arg} ${cidr}`,
+      { timeout: delaiMs, maxBuffer: 16 * 1024 * 1024 },
+      (erreur, sortie) => {
+        if (!sortie) return resolve(null);
+        void erreur; // nmap sort en code non nul pour des avertissements bénins
+
+        const hotes = lireBalayageNmap(sortie);
+        if (hotes.length === 0) return resolve(null);
+
+        resolve({
+          hotes,
+          // Vrai si au moins une MAC est remontée : preuve que la
+          // découverte s'est faite en ARP, donc au niveau 2.
+          parArp: hotes.some((h) => h.mac),
+        });
+      }
+    );
+  });
+}
+
+let balayageNmapSignale = false;
+
+/**
+ * @param {function} [onProgress]  (etape, courant, total) — appelé pendant
+ *   le scan. Sur une plage large, l'identification des machines se compte
+ *   en minutes : sans retour d'avancement, l'agent lancé à la main reste
+ *   muet assez longtemps pour qu'on le croie planté. Optionnel : le cycle
+ *   central ne le fournit pas.
+ */
+async function scanRange({
+  cidr,
+  snmpCommunity = "public",
+  snmpV3 = null,
+  onProgress = null,
+  // Équipements déjà identifiés lors d'un scan précédent, fournis par
+  // l'appelant qui a accès à la base. Voir `peutReutiliser` plus bas :
+  // c'est ce qui évite de réapprendre un système d'exploitation qui n'a
+  // pas changé, et fait passer un rescan de plusieurs minutes à
+  // quelques dizaines de secondes.
+  connus = null,
+  /* Intervalles d'adresses à ne PAS sonder, déclarés dans le plan
+     d'adressage : [{ debut, fin }]. Un automate, un équipement médical,
+     un pare-feu qui journalise chaque connexion — il existe des machines
+     qu'on n'interroge pas, et la plateforme doit pouvoir l'entendre. */
+  exclues = null,
+}) {
+  const avancer = typeof onProgress === "function" ? onProgress : () => {};
+
+  const adressesDeLaPlage = listHostsFromCidr(cidr);
+
+  /* L'exclusion est appliquée AVANT tout envoi, et le nombre d'adresses
+     écartées est rendu à l'appelant : une adresse non sondée doit se
+     lire comme un choix, jamais comme un trou de mesure. */
+  const intervalles = Array.isArray(exclues) ? exclues : [];
+  const estExclue = (ip) => {
+    if (intervalles.length === 0) return false;
+    const v = ipLib.toLong(ip);
+    return intervalles.some((i) => v >= i.debut && v <= i.fin);
+  };
+
+  const hosts =
+    intervalles.length > 0 ? adressesDeLaPlage.filter((h) => !estExclue(h)) : adressesDeLaPlage;
+  const nbExclues = adressesDeLaPlage.length - hosts.length;
+  if (nbExclues > 0) {
+    // Dit, et non tu : une adresse non sondée est un choix de
+    // l'exploitant, jamais un trou de mesure.
+    console.log(
+      `Balayage de ${cidr} : ${nbExclues} adresse(s) écartée(s) — zones ` +
+        "réservées marquées « ne pas scanner » dans le plan d'adressage."
+    );
+  }
+
+  avancer("balayage", 0, hosts.length);
+
+  /* ── LE BALAYAGE : NMAP D'ABORD, LE NÔTRE ENSUITE ──
+     Voir le grand commentaire au-dessus de balayageNmap. `SCAN_BALAYAGE_NMAP=0`
+     revient au balayage maison sans toucher au code. */
+  const macsNmap = new Map();
+  let aliveHosts = null;
+
+  if (process.env.SCAN_BALAYAGE_NMAP !== "0") {
+    const argsExclusion = intervalles
+      .slice(0, 32)
+      .map((i) =>
+        i.debut === i.fin
+          ? ipLib.fromLong(i.debut)
+          : `${ipLib.fromLong(i.debut)}-${ipLib.fromLong(i.fin)}`
+      );
+
+    const resultat = await balayageNmap(cidr, hosts.length, argsExclusion).catch(() => null);
+    if (resultat) {
+      // Ceinture et bretelles : si nmap n'a pas compris une exclusion, on
+      // ne l'inscrit pas pour autant à l'inventaire.
+      aliveHosts = resultat.hotes
+        .filter((h) => !estExclue(h.ip))
+        .map((h) => ({ ip: h.ip, latency: h.latency }));
+      for (const h of resultat.hotes) if (h.mac) macsNmap.set(h.ip, h.mac);
+
+      if (!balayageNmapSignale) {
+        balayageNmapSignale = true;
+        console.log(
+          `Balayage par nmap : ${resultat.hotes.length} machine(s) vivante(s)` +
+            (resultat.parArp
+              ? " — découvertes en ARP, au niveau 2 : aucune machine du segment ne peut s'y soustraire."
+              : " — sans ARP (droits insuffisants ou site distant) : nmap a sondé en TCP/ICMP.")
+        );
+      }
+    } else if (!balayageNmapSignale) {
+      balayageNmapSignale = true;
+      console.log(
+        "Balayage par nmap indisponible (nmap absent, ou sans résultat) :" +
+          " repli sur le ping + table ARP, comme avant."
+      );
+    }
+  }
+
+  if (!aliveHosts) aliveHosts = await pingSweep(hosts);
+
+  // Table ARP lue UNE SEULE FOIS par scan : elle sert à la fois à compléter le
+  // ping sweep et à retrouver la MAC de n'importe quel hôte découvert.
+  const toutesLesEntreesArp = await readArpTable();
+
+  /* Le complément par cache ARP n'a de sens QUE derrière le ping sweep.
+     Quand nmap a balayé en ARP, il a déjà interrogé chaque adresse du
+     segment : y ajouter le cache du système ne pourrait qu'introduire
+     des machines parties depuis — exactement les fantômes que ce projet
+     passe son temps à écarter. */
+  const arpSupplement =
+    macsNmap.size > 0 ? [] : await arpComplement(cidr, aliveHosts, toutesLesEntreesArp);
+  const tousLesHotes = [...aliveHosts, ...arpSupplement.map((a) => ({ ip: a.ip, latency: null }))];
+
+  // Registre OUI chargé UNE fois pour tout le scan : la résolution du
+  // fabricant par adresse MAC devient alors une simple lecture en mémoire,
+  // sans requête ni accès réseau par équipement.
+  let registreOui = null;
+  try {
+    registreOui = await chargerRegistre();
+  } catch (err) {
+    console.error("Registre OUI indisponible, fabricants non résolus par MAC:", err.message);
+  }
+
+  // Identification par lots de 5.
+  //
+  // Chaque machine coûte : SNMP (1,5 s d'attente si muette), nmap
+  // (seulement si SNMP n'a pas conclu) et un scan de ports. En séquentiel,
+  // 25 machines actives demandaient plusieurs minutes, passées pour
+  // l'essentiel à attendre des délais d'expiration.
+  //
+  // Le facteur limitant n'est pas notre machine mais le réseau supervisé :
+  // un outil de supervision qui dégrade ce qu'il observe est inutilisable.
+  // À 5 en parallèle, on reste à ~0,5 Mbit/s et sous les seuils de
+  // déclenchement des sondes d'intrusion. Monter à 50 diviserait encore le
+  // temps mais changerait la nature du trafic — 50 balayages simultanés
+  // ressemblent à une reconnaissance hostile, que les pare-feux bloquent.
+  // Le scan rendrait alors moins de résultats en étant plus agressif.
+  //
+  // ── POURQUOI LA VALEUR PAR DÉFAUT PASSE DE 5 À 10 ──
+  //
+  // Ce nombre décide à lui seul de la durée d'un scan. nmap représente
+  // 93 % du temps et coûte jusqu'à 25 s par machine ; le reste du travail
+  // (SNMP muet 1,5 s, ports 0,4 s en parallèle) est négligeable devant
+  // lui. Le temps total vaut donc, en gros :
+  //
+  //     machines vivantes ÷ CONCURRENCE × durée nmap
+  //
+  // Sur un parc réel de 44 machines actives sans cache d'OS :
+  //     à  5 → 9 lots × ~20 s ≈ 3 minutes
+  //     à 10 → 5 lots × ~20 s ≈ 1 min 40
+  //     à 16 → 3 lots × ~20 s ≈ 1 minute
+  //
+  // Le raisonnement d'origine — rester discret pour ne pas déclencher les
+  // sondes d'intrusion — reste juste, et c'est pour cela qu'on ne monte
+  // pas à 50. Mais 10 sondes simultanées représentent environ 1 Mbit/s :
+  // c'est le trafic d'une seule page web qui se charge, très loin de ce
+  // qu'un pare-feu interprète comme une reconnaissance hostile.
+  //
+  // Le plafond passe de 20 à 32 : un serveur de supervision moderne tient
+  // la charge, et le facteur limitant reste le réseau supervisé, pas lui.
+  // Qui scanne son propre réseau, la nuit, sans sonde d'intrusion, a le
+  // droit d'aller vite — c'est son réseau.
+  //
+  // SI LE SCAN RESTE LENT APRÈS CE RÉGLAGE, la cause est ailleurs : voir
+  // la réutilisation de l'OS déjà connu, plus bas (`peutReutiliser`). Elle
+  // exige une adresse MAC, que la table ARP du serveur ne connaît QUE pour
+  // les réseaux directement raccordés. Sur un VLAN routé, aucune MAC n'est
+  // vue, le cache ne s'applique jamais, et chaque scan repaye nmap en
+  // entier. C'est le cas qui rend un rescan aussi lent que le premier.
+  const CONCURRENCE_IDENTIFICATION = Number(process.env.SCAN_CONCURRENCE) > 0
+    ? Math.min(32, Number(process.env.SCAN_CONCURRENCE))
+    : 10;
+
+  /**
+   * Identifie une machine. Ne lève jamais : un hôte qui fait échouer SNMP
+   * ou nmap ne doit pas emporter son lot avec lui (Promise.all rejette au
+   * premier échec — d'où la capture ICI et non autour du lot).
+   *
+   * @returns {object|null} l'équipement, ou null s'il n'a pas pu être analysé
+   */
+  async function analyserHote(host) {
+    try {
+      const snmpData = snmpV3
+        ? await snmpProbeV3(host.ip, snmpV3)
+        : await snmpProbe(host.ip, snmpCommunity);
+
+      const fp = fingerprint(snmpData);
+      let osDetecte = null;
+      let nmapDeviceType = null;
+      const fabricantSnmp = fp.fabricant;
+      let fabricantNmap = null;
+
+      // nmap en dernier recours seulement : coûteux (jusqu'à 15 s par hôte).
+      // On l'appelle si le texte SNMP n'a pas permis de conclure — ce qui
+      // couvre l'absence de réponse SNMP comme une réponse inexploitable.
+      const typeSnmp = typeDepuisTexte(
+        [snmpData?.sysDescr, snmpData?.sysName].filter(Boolean).join(" "),
+        "snmp"
+      );
+      // ── CE QU'ON NE REDEMANDE PAS ──
+      //
+      // nmap représente 93 % du temps d'un scan, et il répond toujours la
+      // même chose : un système d'exploitation ne change pas d'un scan à
+      // l'autre. On repayait donc 7 secondes par machine pour réapprendre
+      // ce qu'on savait déjà.
+      //
+      // La réponse précédente n'est réutilisée QUE si l'adresse matérielle
+      // est identique. C'est la condition qui rend la réutilisation sûre :
+      // en DHCP, une adresse IP change de machine, et sans ce contrôle on
+      // attribuerait le système du poste d'hier à la caméra d'aujourd'hui.
+      //
+      // MAC inconnue des deux côtés : on refait le travail. Mieux vaut
+      // sept secondes qu'une identité recopiée sur la mauvaise machine.
+      /* La MAC vue par nmap prime sur celle du cache ARP : elle vient
+         d'une réponse obtenue à l'instant, là où le cache peut porter
+         l'adresse d'une machine partie depuis. Comparer une identité
+         sur un souvenir ferait réutiliser l'empreinte du poste d'hier
+         pour la caméra d'aujourd'hui — exactement ce que ce contrôle
+         existe pour empêcher. */
+      const macActuelle = normaliserMacSimple(
+        macsNmap.get(host.ip) || (toutesLesEntreesArp.find((a) => a.ip === host.ip) || {}).mac
+      );
+      const ancien = connus instanceof Map ? connus.get(host.ip) : null;
+      const peutReutiliser =
+        ancien &&
+        ancien.os_detecte &&
+        macActuelle &&
+        normaliserMacSimple(ancien.adresse_mac) === macActuelle;
+
+      if (!typeSnmp) {
+        if (peutReutiliser) {
+          osDetecte = ancien.os_detecte;
+          nmapDeviceType = ancien.type_detecte_nmap || null;
+          fabricantNmap = fabricantFromOsString(ancien.os_detecte);
+        } else {
+          const nmapResult = await nmapFingerprint(host.ip);
+          if (nmapResult) {
+            osDetecte = nmapResult.os_detecte;
+            nmapDeviceType = nmapResult.type_detecte;
+            fabricantNmap = fabricantFromOsString(nmapResult.os_detecte);
+          }
+        }
+      }
+
+      // Ports scannés AVANT la classification : un port 9100 ouvert
+      // catégorise à lui seul une imprimante muette en SNMP comme en nmap.
+      // Le résultat est réutilisé par routes/scan.js pour SERVICE_DETECTE,
+      // il n'est donc pas scanné deux fois.
+      let portsOuverts = [];
+      try {
+        portsOuverts = await scanPorts(host.ip);
+      } catch (err) {
+        console.error(`Scan de ports de ${host.ip} échoué:`, err.message);
+      }
+
+      const arpMatch = toutesLesEntreesArp.find((a) => a.ip === host.ip);
+      // Même règle : la mesure fraîche de nmap avant le souvenir du cache.
+      const mac = macsNmap.get(host.ip) || (arpMatch ? arpMatch.mac : null);
+      const parOui = registreOui ? resoudreAvecRegistre(mac, registreOui) : null;
+
+      // BANNIÈRE WEB — seulement quand SNMP n'a rien donné.
+      //
+      // Un équipement muet en SNMP sert souvent une interface
+      // d'administration sur le port 80, dont le titre porte la marque et
+      // le modèle exacts : « HP LaserJet MFP M428fdw », « DS216j ». C'est
+      // une déclaration de l'appareil, pas une déduction — d'où sa place
+      // au-dessus de nmap, qui ne donne qu'un système d'exploitation.
+      //
+      // Coût nul quand aucun port HTTP n'est ouvert (on n'ouvre alors
+      // aucune connexion), et le port est déjà connu par scanPorts.
+      // Même raisonnement que pour nmap : le titre de la page
+      // d'administration d'une imprimante ne change pas d'un scan à
+      // l'autre. On ne la relit que si l'appareil n'est pas déjà connu.
+      let banniere = null;
+      if (!snmpData?.sysDescr && !peutReutiliser) {
+        banniere = await lireBanniere(host.ip, portsOuverts);
+      }
+
+      /* ── QUEL LOGICIEL, ET DANS QUELLE VERSION ──
+
+         La plupart des services se présentent d'eux-mêmes dès qu'on ouvre
+         une connexion : « SSH-2.0-OpenSSH_8.2p1 », « 220 ProFTPD 1.3.5 ».
+         On écoute cette annonce, on n'envoie aucune sonde.
+
+         POURQUOI CE N'EST PAS UN DÉTAIL D'INVENTAIRE. Jusqu'ici la
+         plateforme ne savait dire que « le port 22 est ouvert » — une
+         information sur laquelle aucune faille connue ne peut être
+         rattachée sans mentir. « OpenSSH 7.4 » est d'une autre nature :
+         c'est une version précise d'un logiciel précis.
+
+         Le coût est payé UNIQUEMENT sur les ports concernés, et une
+         annonce arrive en quelques millisecondes. Un port qui accepte la
+         connexion sans rien dire coûte 1,2 seconde au plus. */
+      try {
+        portsOuverts = await identifierVersions(host.ip, portsOuverts, banniere);
+      } catch (err) {
+        console.error(`Lecture des versions de ${host.ip} échouée:`, err.message);
+      }
+
+      /* ── LA CARTE D'IDENTITÉ DES SERVICES CHIFFRÉS ──
+
+         Un certificat qui expire ne se dégrade pas : il coupe. C'est une
+         panne qu'on voit venir trente jours à l'avance, ou jamais.
+
+         Un serveur TLS présente son certificat AVANT toute
+         authentification — c'est le principe du protocole, et ce que
+         fait chaque navigateur des milliers de fois par jour. On lit, on
+         referme, on n'envoie rien.
+
+         Le coût est nul sur l'immense majorité d'un parc bureautique :
+         sans port chiffré ouvert, aucune connexion n'est tentée. Il se
+         paie sur les imprimantes et les équipements d'administration,
+         qui en exposent presque tous un. SCAN_CERTIFICATS=0 le désactive
+         pour qui préfère la vitesse. */
+      let certificats = [];
+      if (process.env.SCAN_CERTIFICATS !== "0") {
+        certificats = await examinerCertificats(host.ip, portsOuverts).catch((err) => {
+          console.error(`Lecture des certificats de ${host.ip} échouée:`, err.message);
+          return [];
+        });
+      }
+
+      // PRIORITÉ DES SOURCES : SNMP > OUI > nmap.
+      //
+      // SNMP en premier : l'équipement se décrit lui-même, c'est le vrai
+      // constructeur de la machine.
+      //
+      // OUI avant nmap, et c'est le point qui mérite justification. Le
+      // « fabricant » déduit de nmap vient du système d'exploitation :
+      // « Microsoft », « Linux », « Apple ». Or « Linux » n'est pas un
+      // fabricant, et « Microsoft » désigne l'éditeur de l'OS, pas le
+      // constructeur du matériel. L'OUI, lui, donne un vrai constructeur
+      // de carte réseau — « Dell », « Intel », « Hewlett-Packard ».
+      // L'information de nmap n'est pas perdue pour autant : elle vit
+      // déjà dans `os_detecte`, qui est sa place légitime.
+      //
+      // Limite assumée : l'OUI identifie la CARTE réseau. Un serveur Dell
+      // avec une carte Intel remontera « Intel ». D'où le champ
+      // `fabricant_source`, qui permet à l'interface de nuancer.
+      let fabricant = null;
+      let fabricantSource = null;
+
+      // La bannière web s'intercale entre l'OUI et nmap : elle nomme un
+      // MODÈLE (« HP LaserJet MFP M428 »), là où nmap ne donne qu'un
+      // système. Mais elle passe après l'OUI, car un titre de page peut
+      // avoir été personnalisé par l'exploitant, pas une adresse MAC.
+      const texteBanniere = [banniere?.titre, banniere?.serveur]
+        .filter(Boolean)
+        .join(" ");
+      const fabricantBanniere = texteBanniere
+        ? fabricantFromOsString(texteBanniere)
+        : null;
+
+      if (fabricantSnmp && fabricantSnmp !== "inconnu") {
+        fabricant = fabricantSnmp;
+        fabricantSource = "snmp";
+      } else if (parOui && parOui.fabricant) {
+        fabricant = parOui.fabricant;
+        fabricantSource = "oui";
+      } else if (fabricantBanniere) {
+        fabricant = fabricantBanniere;
+        fabricantSource = "banniere_web";
+      } else if (fabricantNmap) {
+        fabricant = fabricantNmap;
+        fabricantSource = "nmap";
+      }
+
+      // Une seule décision, prise sur l'ensemble des signaux : voir
+      // services/typeService.js pour l'ordre de confiance et sa
+      // justification. Le service ne produit jamais autre chose qu'une
+      // catégorie du vocabulaire fermé, ou « inconnu ».
+      //
+      // La bannière est passée dans SON PROPRE champ, et non en `sysDescr`
+      // de repli : mélangée au texte SNMP, elle hériterait de sa confiance
+      // et débloquerait les règles d'équipement réseau qui lui sont
+      // réservées.
+      const classification = determinerType({
+        sysDescr: snmpData ? snmpData.sysDescr : null,
+        sysName: snmpData ? snmpData.sysName : null,
+        osDetecte,
+        nmapDeviceType,
+        ports: portsOuverts,
+        fabricant,
+        banniereWeb: texteBanniere || null,
+      });
+
+      // NOM DE LA MACHINE — même raisonnement que pour le fabricant.
+      //
+      // CE QUI N'ALLAIT PAS : à défaut de SNMP, le nom retombait sur
+      // `osDetecte`, l'estimation de système d'exploitation de nmap.
+      // La liste affichait donc des lignes comme « 3Com OfficeConnect
+      // 3CRWER100-75 wireless broadband router (96%) » dans la colonne
+      // « nom » — un modèle avec son taux de confiance, jamais un nom.
+      //
+      // C'est exactement l'erreur déjà écartée pour le fabricant : une
+      // donnée rangée dans un champ qui n'est pas le sien. L'estimation
+      // de nmap n'est pas perdue, elle vit dans `os_detecte`.
+      //
+      // ORDRE DE CONFIANCE :
+      //   1. sysName SNMP — le nom que la machine se donne elle-même ;
+      //   2. DNS inverse  — le nom que le réseau lui reconnaît ;
+      //   3. SMB          — le nom annoncé par le partage de fichiers
+      //                     Windows, avant toute authentification ;
+      //   4. NetBIOS      — le nom que le poste annonce lui-même ;
+      //   5. mDNS         — le nom que l'appareil diffuse ;
+      //   6. rien.
+      //
+      // Voir services/nomService.js pour le détail. Les sources réseau
+      // ne sont interrogées que si SNMP n'a rien donné.
+      /* LA SONDE SMB N'EST LANCÉE QUE SI LE PORT 445 EST OUVERT.
+         Elle nomme les postes Windows où NetBIOS est désactivé — sur ce
+         parc, la majorité. Mais elle ouvre une connexion TCP, donc elle
+         laisse une trace dans le journal du poste, là où NetBIOS et mDNS
+         sont de simples questions en UDP. La lancer sur une adresse dont
+         on sait déjà qu'elle n'écoute pas sur 445 serait du bruit pur :
+         aucune chance de réponse, et une ligne de plus dans les journaux
+         d'un réseau qui n'est pas le nôtre. */
+      const exposeSmb = portsOuverts.some((s) => s.port === 445);
+
+      const { nom, source: nomSource } = await resoudreNom(
+        host.ip,
+        snmpData ? snmpData.sysName : null,
+        { smb: exposeSmb }
+      );
+
+      /* ── QU'EST-CE QUI PROUVE QUE CETTE MACHINE EXISTE ? ──
+
+         Cinq preuves possibles, de la plus directe à la plus indirecte.
+         La première trouvée l'emporte : inutile de chercher plus loin
+         quand la machine a déjà répondu.
+
+         La cinquième — la sonde de refus TCP — n'est tentée QUE si les
+         quatre autres ont échoué. C'est le cas de l'adresse trouvée dans
+         le seul cache ARP : soit elle refuse une connexion, et elle
+         existe ; soit elle reste muette, et il n'y a personne. */
+      let preuve = null;
+      if (host.latency !== null && host.latency !== undefined) {
+        preuve = { preuve: "ping", detail: `réponse au ping (${Math.round(host.latency) || "<1"} ms)` };
+      } else if (portsOuverts.length > 0) {
+        preuve = { preuve: "port_ouvert", detail: `port ${portsOuverts[0].port} ouvert` };
+      } else if (snmpData) {
+        preuve = { preuve: "snmp", detail: "réponse SNMP" };
+      } else if (osDetecte) {
+        preuve = { preuve: "nmap", detail: `empreinte nmap : ${String(osDetecte).slice(0, 60)}` };
+      } else {
+        preuve = await preuveDePresence(host.ip).catch(() => null);
+      }
+
+      return {
+        adresse_ip: host.ip,
+        adresse_mac: mac,
+        latence_ms: host.latency,
+        sys_descr: snmpData ? snmpData.sysDescr : null,
+        nom: nom || null,
+        nom_source: nomSource,
+        type_detecte: classification.type,
+        type_source: classification.source,
+        fabricant,
+        fabricant_source: fabricantSource,
+        mac_aleatoire: parOui ? parOui.aleatoire : false,
+        os_detecte: osDetecte,
+        // Transmis pour éviter un second scan de ports côté routes/scan.js.
+        services: portsOuverts,
+        certificats,
+
+        /* ── « EN LIGNE » DEMANDE UNE PREUVE ──
+           Le statut était écrit « up » pour tout hôte analysé, sans
+           distinction. Or le balayage complète le ping par la table ARP du
+           poste, qui garde en mémoire les machines vues il y a quelques
+           minutes. Un portable déjà parti y figure encore, et se retrouvait
+           enregistré « en ligne » sans avoir jamais répondu.
+
+           On exige donc au moins un signe de vie : une réponse au ping, un
+           port TCP ouvert, une réponse SNMP, ou une empreinte nmap. Sans
+           aucun des quatre, l'appareil est « inconnu » — l'ENUM le prévoit.
+           La nuance n'est pas cosmétique : « up » affirme un fonctionnement
+           constaté, « inconnu » dit qu'on a vu une trace sans pouvoir la
+           confirmer.
+
+           Ce que ça change à l'écran : après un scan, le tableau de bord
+           cesse d'annoncer un parc en meilleure santé qu'il ne l'est. */
+        statut: preuve ? "up" : "inconnu",
+
+        /* ── LA PREUVE D'EXISTENCE, ET SA DATE ──
+
+           C'est ce qu'aucun autre outil ne dit. Zabbix, Nagios, Centreon
+           et Checkmk montrent un hôte et son état ; aucun ne dit SUR QUELLE
+           PREUVE cet hôte figure dans la liste. C'est exactement le trou
+           par lequel une adresse fantôme entre à l'inventaire — et
+           Checkmk y tombe encore, son forum en témoigne.
+
+           La plateforme enregistrait déjà quelle règle avait décidé du
+           type, du nom et du fabricant. Il manquait la ligne la plus
+           fondamentale : pourquoi cette machine est-elle là du tout ?
+
+           Un client qui conteste une ligne obtient sa réponse en une
+           phrase : « refus de connexion sur le port 445, le 9 septembre
+           à 13h42 ». Et un fantôme devient impossible : sans preuve, pas
+           de ligne. */
+        preuve_existence: preuve ? preuve.preuve : null,
+        preuve_detail: preuve ? preuve.detail : null,
+        derniere_decouverte: new Date(),
+      };
+    } catch (err) {
+      console.error(`Analyse de ${host.ip} échouée, hôte ignoré:`, err.message);
+      return null;
+    }
+  }
+
+  const analyses = await parLots(
+    tousLesHotes,
+    CONCURRENCE_IDENTIFICATION,
+    (host) => analyserHote(host),
+    (traites, total) => avancer("identification", traites, total)
+  );
+
+  // Les hôtes dont l'analyse a échoué renvoient null : on les écarte ici
+  // plutôt que d'insérer des trous dans la liste. L'ordre des adresses
+  // est conservé (voir parLots.js).
+  return analyses.filter(Boolean);
+}
+
+/**
+ * Tente de comprendre pourquoi un équipement ne répond plus au ping,
+ * en testant s'il répond au moins sur un port TCP courant.
+ */
+function testPort(ip, port, timeoutMs = 800) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => { socket.destroy(); resolve(true); });
+    socket.once("timeout", () => { socket.destroy(); resolve(false); });
+    socket.once("error", () => { resolve(false); });
+    socket.connect(port, ip);
+  });
+}
+
+/**
+ * Sonde de PRÉSENCE, distincte de la sonde de service.
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * CE QUE `testPort` JETTE, ET POURQUOI ÇA COMPTE
+ *
+ * `testPort` répond « ouvert » ou « pas ouvert ». Il met dans le même sac
+ * deux réponses qui n'ont rien à voir :
+ *
+ *   • REFUS DE CONNEXION (ECONNREFUSED) — la machine est là, elle a
+ *     répondu tout de suite, ce port-là est simplement fermé ;
+ *   • SILENCE (délai dépassé, hôte injoignable) — personne n'a répondu.
+ *
+ * Un refus est une PREUVE DE PRÉSENCE. C'est le « TCP ping » que nmap
+ * emploie avec l'option -PS, et c'est l'équivalent portable de l'ARP ping
+ * de ntopng : ntop explique choisir ARP parce qu'il travaille à la
+ * couche 2 et ne peut pas être filtré, contrairement à ICMP. Nous ne
+ * pouvons pas émettre d'ARP sans droits particuliers ni dépendance
+ * native ; le refus TCP donne la même certitude, sans privilège, sous
+ * Windows comme sous Linux.
+ *
+ * CE QUE ÇA CHANGE. Une machine qui bloque le ping, n'expose aucun port
+ * et ne parle pas SNMP était jusqu'ici indiscernable d'une adresse
+ * fantôme. Elle devient identifiable — et le fantôme, lui, reste
+ * silencieux sur les deux comptes.
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * @returns {Promise<"ouvert"|"refuse"|"silence">}
+ */
+function sonderPresence(ip, port, timeoutMs = 700) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let repondu = false;
+    const finir = (verdict) => {
+      if (repondu) return;
+      repondu = true;
+      socket.destroy();
+      resolve(verdict);
+    };
+
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finir("ouvert"));
+    socket.once("timeout", () => finir("silence"));
+    socket.once("error", (err) => {
+      // ECONNREFUSED : quelqu'un a répondu « ce port est fermé ». Il faut
+      // donc une pile réseau vivante à cette adresse.
+      // ECONNRESET : une réponse aussi, brutale mais réelle.
+      // EHOSTUNREACH / ENETUNREACH / ETIMEDOUT : rien à cette adresse.
+      finir(err.code === "ECONNREFUSED" || err.code === "ECONNRESET" ? "refuse" : "silence");
+    });
+
+    socket.connect(port, ip);
+  });
+}
+
+/**
+ * Cette adresse abrite-t-elle une machine ? Renvoie la preuve, ou null.
+ *
+ * Les ports choisis sont ceux qu'une pile réseau refuse le plus
+ * franchement quand rien n'écoute : ils sont testés EN PARALLÈLE, le
+ * coût est celui d'un seul délai.
+ */
+const PORTS_PRESENCE = [445, 135, 80, 443, 22, 3389];
+
+async function preuveDePresence(ip) {
+  const verdicts = await Promise.all(
+    PORTS_PRESENCE.map(async (port) => ({
+      port,
+      verdict: await sonderPresence(ip, port).catch(() => "silence"),
+    }))
+  );
+
+  const ouvert = verdicts.find((v) => v.verdict === "ouvert");
+  if (ouvert) return { preuve: "port_ouvert", detail: `port ${ouvert.port} ouvert` };
+
+  const refus = verdicts.find((v) => v.verdict === "refuse");
+  if (refus) {
+    return {
+      preuve: "refus_tcp",
+      detail: `refus de connexion sur le port ${refus.port} — la machine répond, ce port est fermé`,
+    };
+  }
+  return null;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   LA TABLE DE VOISINAGE : LA DERNIÈRE PREUVE, ET LA PLUS BASSE.
+
+   POURQUOI ELLE EXISTE ICI.
+
+   Un poste Windows correctement pare-feuté ne répond ni au ping, ni sur
+   aucun port : ni ouverture, ni refus, rien. Au niveau IP, il est
+   indiscernable d'une adresse vide. Et pourtant il est là, allumé, et sa
+   carte réseau RÉPOND — parce qu'elle n'a pas le choix : sans réponse
+   ARP, elle ne recevrait plus rien du tout. ARP vit sous IP, sous le
+   pare-feu, et ne peut pas être filtré sur un réseau local. C'est pour
+   cette raison que nmap emploie l'ARP ping dès que la cible est sur le
+   même segment, et que ntopng le préfère à tout le reste.
+
+   CE QU'ON LIT, ET POURQUOI CE N'EST PAS `arp -a`.
+
+   `arp -a` donne des adresses et des MAC, sans dire QUAND chacune a été
+   confirmée. Une machine partie il y a dix minutes y figure encore : la
+   lire comme une preuve de vie serait exactement le défaut qu'on
+   reproche au reste du marché — et c'est déjà ce défaut qui remplissait
+   l'inventaire de fantômes avant la sonde de refus TCP.
+
+   `Get-NetNeighbor` donne en plus l'ÉTAT de chaque entrée. Un seul de
+   ces états est une preuve : `Reachable` — le système a reçu une réponse
+   de cette machine dans les dernières dizaines de secondes. `Stale`
+   signifie « je l'ai connue, je n'ai rien vérifié depuis » ;
+   `Incomplete` et `Unreachable` signifient qu'elle n'a pas répondu à
+   l'appel. On ne retient que `Reachable`, et rien d'autre.
+
+   CE QUE ÇA NE PEUT PAS FAIRE. Une machine d'un autre sous-réseau n'a
+   aucune entrée de voisinage — les paquets partent vers la passerelle.
+   Cette preuve ne vaut donc que pour le segment local du serveur, et
+   c'est très bien ainsi : ailleurs, elle mentirait.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/** Table lue en UNE fois et gardée brièvement : un cycle de supervision
+ *  interroge cent machines, il ne doit pas lancer cent lectures. */
+let voisinsCache = { instant: 0, table: new Map() };
+const VOISINAGE_TTL_MS = 20_000;
+
+function lireTableVoisinage() {
+  return new Promise((resolve) => {
+    if (process.platform !== "win32") {
+      // Sous Linux, `ip neigh` donne le même état (REACHABLE, STALE…).
+      return exec("ip neigh show", { timeout: 5000 }, (err, sortie) => {
+        if (err || !sortie) return resolve(new Map());
+        const table = new Map();
+        for (const ligne of String(sortie).split("\n")) {
+          // « 192.168.0.18 dev eth0 lladdr a4:34:d9:1f:22:03 REACHABLE »
+          const m = ligne.match(
+            /^(\d+\.\d+\.\d+\.\d+)\s.*lladdr\s+([0-9a-f:]{11,17})\s+(\w+)/i
+          );
+          if (m) {
+            table.set(m[1], {
+              mac: m[2],
+              etat: m[3].toUpperCase() === "REACHABLE" ? "Reachable" : m[3],
+            });
+          }
+        }
+        return resolve(table);
+      });
+    }
+
+    /* `execFile` et non `exec` : la commande n'est pas assemblée en une
+       chaîne que cmd.exe devrait redécouper. Le tube, les accolades et
+       les apostrophes de PowerShell partent tels quels, sans niveau de
+       guillemets supplémentaire à faire coïncider. */
+    execFile(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue | " +
+          "ForEach-Object { $_.IPAddress + ';' + $_.LinkLayerAddress + ';' + $_.State }",
+      ],
+      { timeout: 8000, windowsHide: true },
+      (err, sortie) => {
+        if (err || !sortie) return resolve(new Map());
+        const table = new Map();
+        for (const ligne of String(sortie).split("\n")) {
+          const [ip, mac, etat] = ligne.trim().split(";");
+          if (!ip || !mac || !etat) continue;
+          table.set(ip.trim(), { mac: mac.trim(), etat: etat.trim() });
+        }
+        resolve(table);
+      }
+    );
+  });
+}
+
+/** MAC de diffusion ou de multidiffusion : ce n'est personne. */
+function macDeGroupe(mac) {
+  const propre = String(mac || "").toLowerCase().replace(/[^0-9a-f]/g, "");
+  if (propre.length !== 12) return true;
+  if (propre === "ffffffffffff" || propre === "000000000000") return true;
+  return propre.startsWith("01005e") || propre.startsWith("3333");
+}
+
+/**
+ * Cette adresse a-t-elle répondu au niveau 2, tout récemment ?
+ * @returns {Promise<{preuve:string, detail:string}|null>}
+ */
+async function preuveVoisinage(ip) {
+  const maintenant = Date.now();
+  if (maintenant - voisinsCache.instant > VOISINAGE_TTL_MS) {
+    voisinsCache = {
+      instant: maintenant,
+      table: await lireTableVoisinage().catch(() => new Map()),
+    };
+  }
+
+  const entree = voisinsCache.table.get(String(ip));
+  if (!entree || entree.etat !== "Reachable" || macDeGroupe(entree.mac)) return null;
+
+  return {
+    preuve: "voisinage_arp",
+    detail:
+      `répond en ARP (${entree.mac}) : la machine est allumée sur le réseau ` +
+      "local, elle filtre simplement tout ce qui arrive au-dessus",
+  };
+}
+
+/**
+ * Ports interrogés pour savoir si une machine muette au ping est vivante.
+ *
+ * LA LISTE PRÉCÉDENTE PASSAIT À CÔTÉ DU CAS LE PLUS FRÉQUENT.
+ *
+ * Elle contenait 80, 443, 22, 3389 et 8080 — les ports d'un serveur ou
+ * d'un équipement réseau. Or la machine qui bloque le ping par défaut,
+ * c'est le POSTE WINDOWS, et il n'expose aucun de ces cinq-là. Il expose
+ * 445 et 139. Un parc bureautique entier pouvait donc être déclaré en
+ * panne alors qu'il fonctionnait.
+ *
+ * 445 en tête : c'est le plus discriminant sur un réseau d'entreprise.
+ */
+/* Ports interrogés pour décider qu'une machine MUETTE AU PING est
+   malgré tout vivante. Ordre voulu : les plus répandus d'abord, parce
+   que la première réponse suffit et arrête le reste.
+
+   5985 (WinRM) est ajouté pour les Windows récents, où le partage de
+   fichiers est désormais souvent fermé alors que l'administration
+   distante reste ouverte ; 53 pour les serveurs DNS, qui ne répondent
+   presque jamais sur les ports précédents. */
+const PORTS_SIGNE_DE_VIE = [445, 139, 135, 80, 443, 3389, 22, 8080, 5985, 53, 9100, 631];
+
+/**
+ * L'équipement est-il réellement injoignable, ou seulement muet au ping ?
+ *
+ * Les ports sont testés EN PARALLÈLE et non l'un après l'autre. En
+ * séquence, une machine réellement éteinte coûtait la somme de tous les
+ * délais — dix ports à 800 ms, soit huit secondes par équipement et par
+ * vérification. En parallèle, le coût est celui d'un seul délai, quel que
+ * soit le nombre de ports. C'est ce qui permet d'allonger la liste sans
+ * ralentir le cycle.
+ */
+async function diagnosePanne(ip) {
+  /* ── POURQUOI `sonderPresence` ET NON `testPort` ──
+
+     Le défaut corrigé ici était invisible et il faussait tout l'écran.
+
+     `testPort` répond « ouvert » ou « pas ouvert » : il jette le REFUS de
+     connexion dans le même sac que le silence. Or le balayage, lui,
+     distingue les deux depuis l'ajout de `preuveDePresence` — un refus y
+     vaut preuve d'existence, et c'est à ce titre que des machines
+     entrent à l'inventaire en « up ».
+
+     La supervision, elle, refaisait le test avec l'ancienne règle. Une
+     machine admise par le balayage sur un refus TCP était donc dégradée
+     en « inconnu » trois cycles plus tard, par la même plateforme, sur
+     la même adresse. Deux définitions du mot « vivant » dans un même
+     produit : c'est ce qui faisait passer un parc entier en « inconnu »
+     quelques minutes après chaque scan.
+
+     Désormais les deux chemins emploient la même sonde et le même
+     barème. Ce qui prouve une existence au balayage prouve une existence
+     à la supervision. */
+  const resultats = await Promise.all(
+    PORTS_SIGNE_DE_VIE.map(async (port) => ({
+      port,
+      verdict: await sonderPresence(ip, port).catch(() => "silence"),
+    }))
+  );
+
+  const ouvert = resultats.find((r) => r.verdict === "ouvert");
+  if (ouvert) {
+    return {
+      code: "pare_feu_probable",
+      detail:
+        `Ne répond pas au ping, mais le port ${ouvert.port} est ouvert : ` +
+        "la machine fonctionne et bloque simplement les requêtes ICMP " +
+        "(comportement par défaut d'un poste Windows).",
+    };
+  }
+
+  const refus = resultats.find((r) => r.verdict === "refuse");
+  if (refus) {
+    return {
+      code: "refus_tcp",
+      detail:
+        `Ne répond pas au ping et n'expose aucun service, mais REFUSE la ` +
+        `connexion sur le port ${refus.port} : une pile réseau répond à cette ` +
+        "adresse, la machine est donc allumée.",
+    };
+  }
+
+  // Dernier recours, et le seul qui atteigne un poste entièrement
+  // pare-feuté : a-t-il répondu en ARP ? Voir preuveVoisinage.
+  const voisin = await preuveVoisinage(ip).catch(() => null);
+  if (voisin) {
+    return {
+      code: "voisinage_arp",
+      detail:
+        "Ne répond ni au ping, ni sur aucun port, mais " + voisin.detail + ".",
+    };
+  }
+
+  return {
+    code: "injoignable_total",
+    detail: "Aucune réponse (ping, ports courants, ARP) — l'équipement semble réellement injoignable ou éteint.",
+  };
+}
+
+async function scanPorts(ip) {
+  const ports = Object.keys(PORTS_COURANTS).map(Number);
+  const resultats = await Promise.all(
+    ports.map(async (port) => ({
+      port,
+      ouvert: await testPort(ip, port, 400),
+    }))
+  );
+  return resultats
+    .filter((r) => r.ouvert)
+    .map((r) => ({ port: r.port, nom_service: PORTS_COURANTS[r.port] }));
+}
+
+const OID_HR_PROCESSOR_LOAD = "1.3.6.1.2.1.25.3.3.1.2";
+// HOST-RESOURCES-MIB, table du stockage. Les trois colonnes se lisent
+// ensemble : le libellé dit DE QUOI il s'agit (« Physical memory », un
+// disque, un cache…), les deux autres donnent la taille et l'occupation.
+// Elles sont exprimées en unités d'allocation propres à chaque ligne —
+// d'où le rapport occupation/taille, où l'unité se simplifie.
+const OID_HR_STORAGE_DESCR = "1.3.6.1.2.1.25.2.3.1.3";
+const OID_HR_STORAGE_SIZE = "1.3.6.1.2.1.25.2.3.1.5";
+const OID_HR_STORAGE_USED = "1.3.6.1.2.1.25.2.3.1.6";
+const OID_IF_IN_OCTETS = "1.3.6.1.2.1.2.2.1.10";
+const OID_IF_OUT_OCTETS = "1.3.6.1.2.1.2.2.1.16";
+// Inventaire des interfaces (IF-MIB) : nom et états administratif/opérationnel.
+const OID_IF_DESCR = "1.3.6.1.2.1.2.2.1.2";
+// Capacité nominale du lien, en bits/s. Sans elle, un débit brut n'est pas
+// interprétable : 50 000 kbit/s valent 5 % d'un lien gigabit et 500 % d'un
+// lien 10 Mbit/s. C'est la donnée qui rend le taux d'utilisation possible.
+const OID_IF_SPEED = "1.3.6.1.2.1.2.2.1.5";
+const OID_IF_PHYS_ADDRESS = "1.3.6.1.2.1.2.2.1.6";
+const OID_IF_ADMIN_STATUS = "1.3.6.1.2.1.2.2.1.7";
+const OID_IF_OPER_STATUS = "1.3.6.1.2.1.2.2.1.8";
+
+/* ─────────────────────────────────────────────────────────────────────
+   TABLES DE COMMUTATION (BRIDGE-MIB)
+
+   Elles permettent de savoir QUELLE MACHINE est branchée sur QUEL PORT,
+   et donc d'attribuer la consommation d'un port à une machine qui
+   n'expose elle-même aucun SNMP. Voir services/attributionPortService.js
+   pour ce qu'on en fait et ce qu'on refuse d'en déduire.
+
+   Deux variantes coexistent dans la nature :
+     • dot1dTpFdbPort  — BRIDGE-MIB classique, switches simples
+     • dot1qTpFdbPort  — Q-BRIDGE-MIB, switches gérant les VLAN
+   Beaucoup de matériels récents ne remplissent QUE la seconde. On
+   interroge les deux et on garde ce qui répond.
+   ───────────────────────────────────────────────────────────────────── */
+const OID_DOT1D_TP_FDB_PORT = "1.3.6.1.2.1.17.4.3.1.2";
+const OID_DOT1Q_TP_FDB_PORT = "1.3.6.1.2.1.17.7.1.2.2.1.2";
+const OID_DOT1D_BASE_PORT_IFINDEX = "1.3.6.1.2.1.17.1.4.1.2";
+
+/**
+ * Parcourt une sous-arborescence SNMP et renvoie les couples (OID, valeur).
+ *
+ * `snmpColonne()` ne convient pas ici : il rend une valeur par index, or
+ * la table d'apprentissage est indexée par l'adresse MAC — six nombres
+ * accolés à l'OID — parfois précédée du numéro de VLAN. C'est l'index
+ * lui-même qui porte l'information : il faut donc les OID bruts.
+ */
+function snmpParcours(ip, community, oid, timeoutMs = 6000) {
+  return new Promise((resolve) => {
+    let session;
+    const resultats = [];
+    try {
+      session = snmp.createSession(ip, community, { timeout: timeoutMs, retries: 0 });
+    } catch {
+      return resolve([]);
+    }
+    let termine = false;
+    const finir = (valeur) => {
+      if (termine) return;
+      termine = true;
+      try {
+        session.close();
+      } catch {
+        /* déjà fermée */
+      }
+      resolve(valeur);
+    };
+
+    session.on("error", () => finir([]));
+    try {
+      session.subtree(
+        oid,
+        (varbinds) => {
+          for (const vb of varbinds) {
+            if (!snmp.isVarbindError(vb)) resultats.push({ oid: vb.oid, valeur: vb.value });
+          }
+        },
+        (err) => finir(err ? [] : resultats)
+      );
+    } catch {
+      finir([]);
+    }
+  });
+}
+
+/**
+ * Extrait l'adresse MAC des SIX DERNIERS nombres d'un OID.
+ *
+ * On prend les six derniers et non les six suivant la base : en
+ * Q-BRIDGE-MIB, l'index commence par le numéro de VLAN. Prendre depuis
+ * la base donnerait une MAC décalée d'un octet — une adresse
+ * parfaitement formée, et fausse.
+ */
+function macDepuisOid(oid) {
+  const morceaux = String(oid).split(".").map(Number);
+  if (morceaux.length < 6) return null;
+  const octets = morceaux.slice(-6);
+  if (octets.some((o) => !Number.isInteger(o) || o < 0 || o > 255)) return null;
+  return octets.map((o) => o.toString(16).padStart(2, "0")).join(":");
+}
+
+/**
+ * Lit la table de commutation d'un switch.
+ *
+ * @returns {{fdb: Array<{mac,portPont}>, portVersIfIndex: Object, exploitable: boolean, raison: string|null}}
+ */
+async function tableCommutation(ip, community = "public") {
+  const [fdb1d, fdb1q, basePorts] = await Promise.all([
+    snmpParcours(ip, community, OID_DOT1D_TP_FDB_PORT),
+    snmpParcours(ip, community, OID_DOT1Q_TP_FDB_PORT),
+    snmpParcours(ip, community, OID_DOT1D_BASE_PORT_IFINDEX),
+  ]);
+
+  const brut = fdb1d.length > 0 ? fdb1d : fdb1q;
+
+  const fdb = [];
+  for (const { oid, valeur } of brut) {
+    const mac = macDepuisOid(oid);
+    const portPont = Number(valeur);
+    if (mac && Number.isFinite(portPont) && portPont > 0) fdb.push({ mac, portPont });
+  }
+
+  const portVersIfIndex = {};
+  for (const { oid, valeur } of basePorts) {
+    const portPont = Number(String(oid).split(".").pop());
+    const ifIndex = Number(valeur);
+    if (Number.isFinite(portPont) && Number.isFinite(ifIndex) && ifIndex > 0) {
+      portVersIfIndex[portPont] = ifIndex;
+    }
+  }
+
+  if (fdb.length === 0) {
+    return { fdb, portVersIfIndex, exploitable: false, raison: "aucune table d'adresses MAC" };
+  }
+  if (Object.keys(portVersIfIndex).length === 0) {
+    // ON NE SUPPOSE PAS que le numéro de port du pont vaut l'ifIndex.
+    // C'est vrai sur beaucoup de matériels, faux sur beaucoup d'autres —
+    // et quand c'est faux, on attribue le trafic d'une prise à une
+    // machine branchée ailleurs. Un chiffre faux sans le moindre signal
+    // vaut moins que pas de chiffre du tout.
+    return {
+      fdb,
+      portVersIfIndex,
+      exploitable: false,
+      raison: "table de correspondance des ports absente (dot1dBasePortIfIndex)",
+    };
+  }
+
+  return { fdb, portVersIfIndex, exploitable: true, raison: null };
+}
+
+// ifAdminStatus / ifOperStatus : 1 = up, 2 = down, 3 = testing.
+function etatInterface(valeur) {
+  const n = Number(valeur);
+  if (n === 1) return "up";
+  if (n === 2) return "down";
+  return "inconnu";
+}
+
+/**
+ * Formate une adresse MAC issue de ifPhysAddress (Buffer ou chaîne brute)
+ * au format XX-XX-XX-XX-XX-XX, cohérent avec ce que renvoie readArpTable().
+ * Renvoie null si la valeur est absente ou inexploitable.
+ */
+function formaterMacSnmp(valeur) {
+  if (!valeur) return null;
+  let octets;
+  if (Buffer.isBuffer(valeur)) {
+    octets = [...valeur];
+  } else if (typeof valeur === "string" && valeur.length > 0) {
+    octets = [...Buffer.from(valeur, "binary")];
+  } else {
+    return null;
+  }
+  if (octets.length !== 6) return null;
+  if (octets.every((o) => o === 0)) return null;
+  return octets.map((o) => o.toString(16).padStart(2, "0").toUpperCase()).join("-");
+}
+
+/**
+ * Lit UNE COLONNE d'une table SNMP et renvoie { index: valeur }.
+ *
+ * Remplace un appel à `session.table()`, qui attend l'identifiant d'une
+ * TABLE : en lui passant une colonne, il ne trouvait rien à structurer et
+ * renvoyait un objet vide, sans erreur. Bande passante, processeur,
+ * mémoire et taux d'occupation des liens n'ont donc jamais fonctionné,
+ * sur aucun équipement. Le défaut était invisible depuis l'interface, un
+ * objet vide étant aussi ce que renvoie un équipement muet.
+ *
+ * Vérifié sur une imprimante HP : parcours de la colonne via `table()`,
+ * 0 ligne ; parcours brut de la même colonne, 4 valeurs.
+ *
+ * Cette version parcourt la colonne sans présumer de structure et indexe
+ * chaque valeur par ce qui suit l'identifiant de colonne.
+ *
+ * `retries: 1` et non 0 : un parcours enchaîne de nombreux échanges, et un
+ * seul paquet UDP perdu anéantissait la collecte entière.
+ *
+ * @returns {Promise<Object<string, *>>} valeurs indexées, {} si rien
+ */
+function snmpColonne(ip, community, oidColonne, timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    let session;
+    try {
+      session = snmp.createSession(ip, community, { timeout: timeoutMs, retries: 1 });
+    } catch {
+      return resolve({});
+    }
+
+    const valeurs = {};
+    const prefixe = `${oidColonne}.`;
+    let termine = false;
+
+    const finir = () => {
+      if (termine) return;
+      termine = true;
+      try {
+        session.close();
+      } catch {
+        /* session déjà fermée */
+      }
+      // On rend TOUJOURS ce qui a été collecté, même en cas d'erreur en
+      // fin de parcours : une table à moitié lue vaut mieux que rien.
+      resolve(valeurs);
+    };
+
+    session.on("error", finir);
+
+    try {
+      session.subtree(
+        oidColonne,
+        20,
+        (varbinds) => {
+          for (const vb of varbinds) {
+            if (snmp.isVarbindError(vb)) continue;
+            const oid = String(vb.oid);
+            // Le parcours peut déborder sur la colonne suivante : on
+            // n'accepte que ce qui appartient vraiment à celle demandée.
+            if (!oid.startsWith(prefixe)) continue;
+            valeurs[oid.slice(prefixe.length)] = vb.value;
+          }
+        },
+        () => finir()
+      );
+    } catch {
+      finir();
+    }
+  });
+}
+
+/**
+ * Relevé SNMP d'un équipement.
+ *
+ * @param {object} [options]
+ * @param {boolean} [options.avecInventaire=false]
+ *   Récupère en plus le nom, la MAC et les états admin/opérationnel de chaque
+ *   interface (3 interrogations SNMP supplémentaires).
+ *
+ *   VOLONTAIREMENT DÉSACTIVÉ PAR DÉFAUT : le cycle de supervision tourne
+ *   chaque minute sur tout le parc. Passer de 4 à 7 tables SNMP par
+ *   équipement (+75 %) allongerait chaque cycle sans bénéfice réel — le nom
+ *   et le VLAN d'une interface ne changent qu'à la reconfiguration d'un
+ *   switch, pas d'une minute à l'autre. L'inventaire est donc collecté
+ *   pendant les scans (routes/scan.js), qui sont explicites et peu fréquents.
+ *   Le cron continue de ne lire que les compteurs de trafic, indispensables
+ *   au calcul du débit.
+ */
+
+/**
+ * Convertit une valeur SNMP en nombre, ou null.
+ *
+ * POURQUOI PAS `Number()` DIRECTEMENT. `Number(null)` vaut 0, tout comme
+ * `Number("")` et `Number([])`. Une valeur ABSENTE devenait donc « 0 % de
+ * charge processeur » — une affirmation fausse présentée comme une mesure.
+ * Un test l'a attrapée avant qu'elle n'atteigne un client.
+ *
+ * La règle du produit est constante : une case vide vaut mieux qu'un
+ * chiffre inventé.
+ */
+function nombreOuNull(valeur) {
+  // Liste BLANCHE et non liste noire. `Number([])` vaut 0, `Number(true)`
+  // vaut 1 : impossible d'énumérer d'avance tout ce qui se convertit en un
+  // chiffre trompeur. On n'accepte donc que ce qui est légitimement un
+  // nombre — les deux seules formes qu'un agent SNMP produit ici.
+  //
+  // Conséquence assumée : un compteur 64 bits, que la bibliothèque rend
+  // sous forme d'octets bruts, sera écarté. Nous ne lisons que des
+  // compteurs 32 bits ; le jour où cela changera, ce sera un ajout
+  // explicite, pas une conversion accidentelle.
+  if (typeof valeur === "number") return Number.isFinite(valeur) ? valeur : null;
+  if (typeof valeur !== "string") return null;
+  if (valeur.trim() === "") return null;
+  const n = Number(valeur);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Moyenne des charges processeur, en pourcentage, ou null.
+ *
+ * Un équipement multi-cœurs déclare une ligne par cœur. La moyenne est la
+ * seule lecture honnête : le maximum ferait hurler l'alerte dès qu'un seul
+ * cœur travaille, ce qui est le fonctionnement normal d'une machine.
+ *
+ * Les valeurs hors de 0–100 sont écartées : certains agents SNMP publient
+ * -1 pour « je ne sais pas », et une charge négative moyennée fausserait
+ * tout le reste.
+ */
+function moyenneCharges(colonne) {
+  const charges = Object.values(colonne || {})
+    .map(nombreOuNull)
+    .filter((v) => v !== null && v >= 0 && v <= 100);
+  if (charges.length === 0) return null;
+  return charges.reduce((a, b) => a + b, 0) / charges.length;
+}
+
+/**
+ * Libellés qui NE désignent PAS la mémoire vive, même s'ils contiennent
+ * le mot « memory ».
+ *
+ * Vérifiés en écartant : « Flash Memory », « Virtual Memory », « Cached
+ * memory », « Memory buffers », « Shared memory », « ramdisk0 », « HDD »,
+ * « C:\ Label:OS ». Chacun est une vraie ligne rencontrée sur du matériel
+ * ou décrite par la norme HOST-RESOURCES-MIB.
+ */
+const MOTIFS_PAS_MEMOIRE = /disk|disque|swap|virtual|cache|buffer|shared|flash|hdd|ssd|storage|partition|volume|[/\\]/i;
+
+/**
+ * Libellés dont on est SÛR qu'ils désignent la mémoire vive. Ils sont
+ * préférés aux formulations vagues quand plusieurs lignes conviennent.
+ */
+const MOTIFS_MEMOIRE_CERTAINE = /physical memory|real memory|random access memory/i;
+
+/** Formulations acceptables à défaut : le mot « mémoire » ou « ram » seul. */
+const MOTIFS_MEMOIRE_PROBABLE = /\bmemory\b|\bmémoire\b|\bram\b/i;
+
+/**
+ * Taux d'occupation de la mémoire vive, en pourcentage, ou null.
+ *
+ * La première version ne retenait que « physical memory », « real memory »
+ * ou le mot « ram ». Un relevé du parc a montré qu'elle se trompait dans
+ * les deux sens :
+ *
+ *   Canon iR-ADV C3525   RAM(main), Flash Memory, HDD — tous à 0 utilisé.
+ *     → retenu 0 %. Un disque de 78 Go « vide à 0 octet » n'existe pas :
+ *       cet agent déclare les compteurs sans les remplir.
+ *   HP NPI4DDD0A         Random Access Memory, 42 % puis 95 %.
+ *     → retenu rien. Deux mesures valables jetées parce que le libellé
+ *       de HP n'était pas dans la liste — or 95 % d'occupation est
+ *       exactement ce qu'un outil de supervision doit signaler.
+ *
+ * D'où la logique actuelle : écarter d'abord ce qui n'est pas de la
+ * mémoire vive (disques, flash, swap, caches), puis choisir la ligne la
+ * plus explicite parmi celles qui restent.
+ *
+ * Un compteur à zéro est refusé : un équipement qui répond en SNMP fait
+ * tourner un système, son occupation mémoire n'est jamais nulle. Zéro
+ * signifie « champ non rempli », pas « rien n'est utilisé ».
+ */
+function tauxMemoire(colonneDescr, colonneTaille, colonneUtilise) {
+  let meilleur = null;
+
+  for (const [idx, libelle] of Object.entries(colonneDescr || {})) {
+    const texte = String(libelle == null ? "" : libelle).trim();
+    if (!texte) continue;
+    if (MOTIFS_PAS_MEMOIRE.test(texte)) continue;
+
+    const certaine = MOTIFS_MEMOIRE_CERTAINE.test(texte);
+    if (!certaine && !MOTIFS_MEMOIRE_PROBABLE.test(texte)) continue;
+
+    const taille = nombreOuNull((colonneTaille || {})[idx]);
+    const utilise = nombreOuNull((colonneUtilise || {})[idx]);
+    if (taille === null || utilise === null) continue;
+    if (taille <= 0) continue;
+
+    // Zéro octet utilisé sur une machine allumée : compteur non rempli.
+    if (utilise <= 0) continue;
+
+    const rang = certaine ? 2 : 1;
+    // À rang égal, la première ligne l'emporte : les agents déclarent la
+    // mémoire principale avant les mémoires secondaires.
+    if (meilleur === null || rang > meilleur.rang) {
+      // Les deux valeurs sont dans la même unité d'allocation : le
+      // rapport est valable sans jamais avoir à connaître cette unité.
+      meilleur = { rang, taux: Math.min(100, (utilise / taille) * 100) };
+    }
+  }
+
+  return meilleur === null ? null : meilleur.taux;
+}
+
+async function snmpMetrics(ip, community = "public", { avecInventaire = false } = {}) {
+  // Chaque colonne est lue séparément puis recollée par index. C'est ce
+  // que faisait déjà le code appelant — mais il lisait des colonnes en
+  // croyant lire des tables, et n'obtenait donc jamais rien. Voir le
+  // commentaire de snmpColonne pour le détail de ce défaut.
+  const colonnesBase = [
+    snmpColonne(ip, community, OID_HR_PROCESSOR_LOAD),
+    snmpColonne(ip, community, OID_HR_STORAGE_DESCR),
+    snmpColonne(ip, community, OID_HR_STORAGE_SIZE),
+    snmpColonne(ip, community, OID_HR_STORAGE_USED),
+    snmpColonne(ip, community, OID_IF_IN_OCTETS),
+    snmpColonne(ip, community, OID_IF_OUT_OCTETS),
+  ];
+
+  const colonnesInventaire = avecInventaire
+    ? [
+        snmpColonne(ip, community, OID_IF_DESCR),
+        snmpColonne(ip, community, OID_IF_ADMIN_STATUS),
+        snmpColonne(ip, community, OID_IF_OPER_STATUS),
+        snmpColonne(ip, community, OID_IF_PHYS_ADDRESS),
+        snmpColonne(ip, community, OID_IF_SPEED),
+      ]
+    : [];
+
+  const resultats = await Promise.all([...colonnesBase, ...colonnesInventaire]);
+  const [cpuCol, storageDescrCol, storageSizeCol, storageUsedCol, inCol, outCol] = resultats;
+  const [descrCol, adminCol, operCol, macCol, speedCol] = avecInventaire
+    ? resultats.slice(colonnesBase.length)
+    : [null, null, null, null, null];
+
+  const cpuPercent = moyenneCharges(cpuCol);
+  const ramPercent = tauxMemoire(storageDescrCol, storageSizeCol, storageUsedCol);
+
+  // Les index proviennent des compteurs de trafic ; en mode inventaire on
+  // complète avec ceux vus dans ifDescr (une interface peut apparaître dans
+  // l'une et pas dans l'autre selon l'agent SNMP).
+  const indexes = new Set(Object.keys(inCol || {}));
+  if (avecInventaire) {
+    Object.keys(descrCol || {}).forEach((i) => indexes.add(i));
+  }
+
+  const interfaces = [...indexes].map((idx) => {
+    const base = {
+      index: Number(idx),
+      inOctets: Number((inCol || {})[idx]) || 0,
+      outOctets: Number((outCol || {})[idx]) || 0,
+    };
+
+    if (!avecInventaire) return base;
+
+    const nomBrut = (descrCol || {})[idx];
+    const vitesseBits = nombreOuNull((speedCol || {})[idx]);
+    return {
+      ...base,
+      nom: nomBrut === null || nomBrut === undefined ? null : nomBrut.toString().trim() || null,
+      adresseMac: formaterMacSnmp((macCol || {})[idx]),
+      etatAdmin: etatInterface((adminCol || {})[idx]),
+      etatOperationnel: etatInterface((operCol || {})[idx]),
+      // ifSpeed sature à 4294967295 sur les liens ≥ 4 Gbit/s (compteur 32
+      // bits) : au-delà, la valeur n'a plus de sens et on préfère rien.
+      vitesseMbps:
+        vitesseBits !== null && vitesseBits > 0 && vitesseBits < 4294967295
+          ? Math.round(vitesseBits / 1_000_000)
+          : null,
+    };
+  });
+
+  return { cpuPercent, ramPercent, interfaces };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   CE QUI TOURNE DANS UNE MACHINE, SANS Y INSTALLER QUOI QUE CE SOIT
+
+   LA PHRASE QUI ÉTAIT FAUSSE. La fiche d'équipement affichait, faute
+   d'agent : « son intérieur n'est pas observable depuis le réseau, quel
+   que soit l'outil ». C'est faux, et la plateforme en avait déjà la
+   preuve sous la main.
+
+   HOST-RESOURCES-MIB (RFC 2790) est la MIB standard des systèmes. Ce
+   fichier en lit DÉJÀ deux branches :
+
+     1.3.6.1.2.1.25.2  hrStorage    → la mémoire, affichée depuis toujours
+     1.3.6.1.2.1.25.3  hrProcessor  → le processeur, idem
+
+   Et il n'a jamais lu les deux suivantes, qui sont dans la même MIB, sur
+   le même port, avec la même communauté, servies par le même agent SNMP :
+
+     1.3.6.1.2.1.25.4  hrSWRun       → les programmes EN COURS D'EXÉCUTION
+     1.3.6.1.2.1.25.6  hrSWInstalled → les logiciels INSTALLÉS
+
+   Autrement dit : toute machine dont la fiche affiche aujourd'hui un
+   taux de mémoire peut aussi dire ce qui tourne dessus. Aucune
+   installation, aucune commande, aucun identifiant supplémentaire — la
+   réponse était déjà à portée de la question qu'on posait.
+
+   CE QUE ÇA NE COUVRE PAS, ET IL FAUT LE DIRE AU CLIENT. Un poste
+   Windows ordinaire n'active pas le service SNMP : il ne répondra rien
+   ici, et seul un agent installé dessus verra son intérieur. La
+   couverture réelle de cette fonction est donc celle du SNMP sur le
+   parc — serveurs, imprimantes, équipements réseau, machines Linux
+   supervisées. C'est déjà la majorité de ce qui compte, et c'est
+   exactement l'ensemble des machines dont on affiche déjà la charge.
+
+   LE COÛT. Quatre parcours de colonnes, lancés EN PARALLÈLE : le temps
+   d'attente est celui d'un seul, pas de quatre. Et il n'est payé que sur
+   les machines qui ont déjà répondu en SNMP pendant l'identification —
+   jamais sur les muettes, qui sont la majorité d'un parc et qui
+   coûtaient autrefois l'essentiel de la durée du scan.
+   `SCAN_INVENTAIRE_SNMP=0` le désactive pour qui préfère la vitesse.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/** hrSWRunName — nom de l'exécutable de chaque programme en cours. */
+const OID_HR_SW_RUN_NAME = "1.3.6.1.2.1.25.4.2.1.2";
+/** hrSWRunType — 1 inconnu, 2 système, 3 pilote, 4 application. */
+const OID_HR_SW_RUN_TYPE = "1.3.6.1.2.1.25.4.2.1.6";
+/** hrSWRunPerfMem — mémoire occupée par ce programme, en kilo-octets. */
+const OID_HR_SW_RUN_PERF_MEM = "1.3.6.1.2.1.25.5.1.1.2";
+/** hrSWInstalledName — nom de chaque logiciel installé. */
+const OID_HR_SW_INSTALLED_NAME = "1.3.6.1.2.1.25.6.3.1.2";
+
+/**
+ * Plafonds. Une machine bavarde déclare plusieurs centaines de programmes
+ * et parfois un millier de logiciels ; au-delà de ces bornes on ne lit
+ * plus une information, on remplit une table.
+ *
+ * Les programmes gardés sont les plus GROS consommateurs de mémoire, et
+ * non les premiers rencontrés : l'ordre des index SNMP n'a aucun sens
+ * pour un humain, alors que « ce qui pèse le plus » est précisément ce
+ * qu'on vient chercher.
+ */
+const MAX_PROCESSUS_DISTINCTS = 200;
+const MAX_LOGICIELS_INSTALLES = 500;
+
+/** Libellés de hrSWRunType, pour ne pas afficher un chiffre brut. */
+const NATURES_PROGRAMME = {
+  1: null, // « inconnu » : on n'écrit rien plutôt que d'écrire « inconnu »
+  2: "système",
+  3: "pilote",
+  4: "application",
+};
+
+/** Valeur SNMP → texte propre, ou null. */
+function texteSnmp(valeur) {
+  if (valeur === null || valeur === undefined) return null;
+  const s = String(valeur).trim();
+  // Certains agents rendent une chaîne vide plutôt que d'omettre la
+  // ligne : une entrée sans nom n'est pas une entrée.
+  return s === "" ? null : s;
+}
+
+/**
+ * Lit les programmes en cours et les logiciels installés d'une machine.
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * POURQUOI UNE TABLE VIDE EST RENDUE `null` ET JAMAIS `[]`
+ *
+ * C'est le point qui décide si cette fonction est utile ou dangereuse.
+ *
+ * `snmpColonne` rend `{}` dans DEUX situations que rien ne distingue :
+ * la machine n'expose pas cette branche de la MIB, ou elle l'expose et
+ * elle est vide. Or `[]` a un sens précis pour l'appelant — « j'ai
+ * regardé, il n'y a rien » — et déclenche l'EFFACEMENT de ce qui est en
+ * base (voir remplacerProcessus).
+ *
+ * Une machine allumée qui ne fait tourner aucun programme n'existe pas.
+ * Une table vide signifie donc toujours « cette machine ne répond pas
+ * sur cette branche », jamais « rien ne tourne ». On rend `null`, qui ne
+ * touche à rien.
+ *
+ * Sans cette règle, scanner une machine équipée d'un agent effacerait
+ * l'inventaire complet que l'agent venait d'y écrire — un défaut
+ * silencieux, qui ne se serait vu qu'en ouvrant la fiche.
+ *
+ * @returns {Promise<{processus: Array|null, logiciels: Array|null}>}
+ */
+async function snmpInventaireLogiciel(ip, community = "public") {
+  // En parallèle : le temps d'attente est celui du parcours le plus lent,
+  // et non leur somme. Délai plus large que pour les interfaces — ces
+  // tables comptent des centaines de lignes là où une table d'interfaces
+  // en compte quelques dizaines.
+  const [nomsCol, typesCol, memoiresCol, logicielsCol] = await Promise.all([
+    snmpColonne(ip, community, OID_HR_SW_RUN_NAME, 6000),
+    snmpColonne(ip, community, OID_HR_SW_RUN_TYPE, 6000),
+    snmpColonne(ip, community, OID_HR_SW_RUN_PERF_MEM, 6000),
+    snmpColonne(ip, community, OID_HR_SW_INSTALLED_NAME, 6000),
+  ]);
+
+  /* ── LES PROGRAMMES EN COURS, REGROUPÉS PAR NOM ──
+
+     Un navigateur ouvre trente processus du même exécutable. Les lister
+     trente fois remplit l'écran sans rien apprendre : ce qu'on veut
+     savoir, c'est QUOI tourne, en combien d'exemplaires, et ce que ça
+     pèse AU TOTAL.
+
+     C'est exactement la forme que la table PROCESSUS_OBSERVE attend déjà
+     pour les agents — mêmes colonnes, même sens. Les deux sources se
+     rangent donc au même endroit, et la fiche d'équipement n'a pas à
+     savoir laquelle a parlé. */
+  const parNom = new Map();
+  for (const [index, brut] of Object.entries(nomsCol || {})) {
+    const nom = texteSnmp(brut);
+    if (!nom) continue;
+
+    const cle = nom.toLowerCase();
+    const memoire = Number(memoiresCol?.[index]);
+    const nature = NATURES_PROGRAMME[Number(typesCol?.[index])] ?? null;
+
+    const existant = parNom.get(cle);
+    if (existant) {
+      existant.occurrences += 1;
+      if (Number.isFinite(memoire) && memoire >= 0) {
+        existant.memoire_ko = (existant.memoire_ko || 0) + memoire;
+      }
+      // La nature la plus précise l'emporte : un même exécutable peut
+      // être déclaré « inconnu » sur une ligne et « application » sur une
+      // autre, selon l'agent SNMP.
+      if (!existant.nature && nature) existant.nature = nature;
+      continue;
+    }
+
+    parNom.set(cle, {
+      nom,
+      occurrences: 1,
+      memoire_ko: Number.isFinite(memoire) && memoire >= 0 ? memoire : null,
+      nature,
+      // SNMP ne dit JAMAIS sous quel compte un programme tourne — seul un
+      // agent installé sur la machine le sait. On laisse donc vide plutôt
+      // que d'inventer : la colonne existe, et une case vide se lit
+      // « cette source-là ne le dit pas ».
+      utilisateur: null,
+    });
+  }
+
+  const processus =
+    parNom.size === 0
+      ? null
+      : [...parNom.values()]
+          .sort((a, b) => (b.memoire_ko ?? -1) - (a.memoire_ko ?? -1))
+          .slice(0, MAX_PROCESSUS_DISTINCTS);
+
+  /* ── LES LOGICIELS INSTALLÉS ──
+
+     hrSWInstalled ne donne qu'un nom — ni version, ni éditeur, ni date
+     exploitable sans décoder un format d'horodatage propre à la MIB. On
+     écrit donc le nom seul, et les colonnes `version` et `editeur`
+     restent vides : elles ne se rempliront que si un agent passe un jour
+     sur cette machine. Une colonne vide est honnête ; une colonne
+     devinée ne l'est pas. */
+  const nomsLogiciels = new Map();
+  for (const brut of Object.values(logicielsCol || {})) {
+    const nom = texteSnmp(brut);
+    if (!nom) continue;
+    if (!nomsLogiciels.has(nom.toLowerCase())) {
+      nomsLogiciels.set(nom.toLowerCase(), { nom, version: null, editeur: null });
+    }
+  }
+
+  const logiciels =
+    nomsLogiciels.size === 0
+      ? null
+      : [...nomsLogiciels.values()]
+          .sort((a, b) => a.nom.localeCompare(b.nom, "fr"))
+          .slice(0, MAX_LOGICIELS_INSTALLES);
+
+  return { processus, logiciels };
+}
+
+module.exports = {
+  estAdresseReservee,
+  scanRange, pingSweep, snmpProbe, snmpProbeV3, listHostsFromCidr,
+  sonderPresence, preuveDePresence, preuveVoisinage, lireTableVoisinage,
+  diagnosePanne, scanPorts, arpComplement, snmpMetrics, nmapFingerprint,
+  // Programmes en cours et logiciels installés, lus par SNMP — sans agent.
+  snmpInventaireLogiciel,
+  PORTS_SIGNE_DE_VIE, normaliserMacSimple,
+  diagnostiquerPortee, sousReseauxLocaux, estDirectementAttache,
+  wakeOnLan, fingerprint,
+  // Attribution du trafic par port de switch — voir attributionPortService.
+  tableCommutation, macDepuisOid,
+  // Exposés pour les tests : logique pure, sans réseau.
+  moyenneCharges, tauxMemoire, nombreOuNull,
+};

@@ -1,0 +1,144 @@
+# Dépendances
+node_modules/
+*/node_modules/
+
+# Secrets — NE JAMAIS COMMITER
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# Build
+dist/
+dist-ssr/
+build/
+*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Éditeurs / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Rapports et exports générés
+rapport_netsecuremanager.pdf
+rapport_netsecuremanager.xlsx
+
+# ---------------------------------------------------------------------
+# Sauvegardes de base — NE JAMAIS COMMITER
+#
+# Un export de la base contient les données RÉELLES du réseau supervisé :
+# adresses IP, noms de machines, adresses matérielles. Publier ce fichier
+# revient à publier la cartographie réseau du client — de quoi préparer
+# une attaque, et une faute contractuelle vis-à-vis de lui.
+#
+# sauvegarde_alertes.sql, présent à la racine, contient 120 adresses d'un
+# réseau d'entreprise réel. C'est un fichier de travail légitime : il doit
+# rester sur le poste, jamais dans le dépôt.
+# ---------------------------------------------------------------------
+*.sql
+!backend/schema.sql
+!backend/migrations/*.sql
+sauvegarde*.sql
+dump*.sql
+*.dump
+
+# Sorties de diagnostic pouvant contenir des adresses réelles
+diagnostic-*.txt
+sortie-*.txt
+
+# ---------------------------------------------------------------------
+# Outils de diagnostic — instruments de travail, pas livrables.
+#
+# Ces scripts servent à enquêter sur une installation : mesurer les
+# phases d'un scan, sonder un équipement en SNMP, vérifier qu'aucun
+# secret ne sort d'une route. Ils s'exécutent contre un réseau réel et
+# affichent ses adresses.
+#
+# Ils ne font pas partie du produit livré et n'ont rien à faire dans un
+# dépôt public. Ils restent sur le poste de développement.
+#
+# Déjà versionnés ? Les retirer du suivi sans les effacer du disque :
+#     git rm -r --cached backend/tools
+# ---------------------------------------------------------------------
+# « backend/tools/* » et non « backend/tools/ » : git ne sait pas
+# ré-inclure un fichier dont un DOSSIER parent est exclu. Avec la barre
+# oblique seule, les exceptions ci-dessous n'auraient eu aucun effet — et
+# le produit serait parti sans deux outils dont le README parle.
+backend/tools/*
+
+# EXCEPTION — ceux-ci font partie du produit livré.
+#
+# La règle ci-dessus vise les outils de DIAGNOSTIC : ils s'exécutent
+# contre un réseau réel et en affichent les adresses. Les outils
+# ci-dessous n'appartiennent pas à cette famille — ils sont une étape
+# d'exploitation normale, documentée dans le README et attendue par un
+# client. Les exclure du dépôt reviendrait à livrer un produit dont une
+# fonction annoncée est absente.
+!backend/tools/importer-failles.js
+!backend/tools/appliquer-migrations.js
+
+# ---------------------------------------------------------------------
+# Documents de travail — à garder sur le poste, hors du dépôt.
+#
+# Ces fichiers racontent un processus de débogage, pas le produit. Ils
+# décrivent des défauts DEPUIS CORRIGÉS, parfois avec leur mode
+# opératoire : sur un dépôt public, ils donnent une liste de choses à
+# essayer contre les installations existantes, et font douter tout
+# acheteur qui les lit sans savoir qu'ils sont périmés.
+#
+# La documentation destinée aux lecteurs reste versionnée : README.md,
+# TESTER-LA-PLATEFORME.md, INSTALLATION_SITE_DISTANT.md.
+# ---------------------------------------------------------------------
+RAPPORT_*.md
+RAPPORT-*.md
+A-FAIRE.md
+RESTE_A_FAIRE*.md
+OU-EN-SUIS-JE.md
+SUITE-DES-TESTS.md
+CLAUDE.md
+
+# Fichiers de travail temporaires (scripts de vérification ponctuels).
+_a_supprimer/
+
+# Documents de travail de la campagne du 8-9 septembre : ils décrivent des
+# défauts DEPUIS CORRIGÉS avec leur mécanisme — même raison que les RAPPORT_*.
+AUDIT-COMPLET-*.md
+OU-EN-EST-LE-PROJET.md
+FICHE-TEST.md
+
+# Dossier créé par l'assistant pour déposer un fichier de travail. Rien
+# du produit n'y vit ; il peut être supprimé sans conséquence.
+Claude outputs/
+
+# ─────────────────────────────────────────────────────────────────────
+# CLÉ PRIVÉE DE SIGNATURE DES LICENCES — NE JAMAIS COMMITER
+#
+# Celui qui obtient ce fichier peut émettre autant de licences
+# Entreprise qu'il veut, et rien ne permettrait de les distinguer des
+# vraies. Le publier une seule fois, même dans un dépôt privé rendu
+# public plus tard, détruit le modèle commercial — et réécrire
+# l'historique git n'y changerait rien, la clé aurait été vue.
+#
+# La clé PUBLIQUE, elle, est faite pour être distribuée : elle vit dans
+# le .env de chaque client et ne permet que de VÉRIFIER une signature.
+# ─────────────────────────────────────────────────────────────────────
+licence-privee.pem
+*.pem
+!**/exemple*.pem

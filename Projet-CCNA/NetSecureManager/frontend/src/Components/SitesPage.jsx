@@ -1,0 +1,273 @@
+import { useEffect, useState } from "react";
+import axios from "axios";
+import MiseEnServiceAgent from "./MiseEnServiceAgent";
+
+import { decrireErreur } from "../utils/erreurReseau";
+
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000/api";
+
+/**
+ * @param {Function} onSitesModifies  prévient l'en-tête qu'il doit relire
+ *   sa liste. La création comme la suppression l'appellent : le
+ *   sélecteur « Site supervisé » vit dans App.jsx et ne devine rien.
+ */
+export default function SitesPage({ onSitesModifies }) {
+  const [sites, setSites] = useState([]);
+  const [nom, setNom] = useState("");
+  const [ville, setVille] = useState("");
+  const [erreur, setErreur] = useState(null);
+  const [miseEnService, setMiseEnService] = useState(null);
+  const [message, setMessage] = useState(null);
+  /* Le site en cours de suppression : le bouton se désactive pendant
+     l'aller-retour. Sans ça, un double clic envoie deux requêtes, et la
+     seconde échoue sur un site qui n'existe plus — un message d'erreur
+     pour une opération qui a parfaitement réussi. */
+  const [suppressionEnCours, setSuppressionEnCours] = useState(null);
+  // Échec de LECTURE, distinct de `erreur` qui porte les échecs de
+  // création. Sans lui, un serveur injoignable affichait « aucun site »,
+  // et l'utilisateur en créait un second alors que le premier existait.
+  const [erreurChargement, setErreurChargement] = useState(null);
+  // Site dont le mode de supervision est en cours de changement : évite
+  // qu'un double clic envoie deux requêtes contradictoires.
+  const [modeEnCours, setModeEnCours] = useState(null);
+
+  async function charger() {
+    const { data } = await axios.get(`${API_URL}/sites`);
+    setSites(data);
+  }
+
+  /**
+   * Change qui supervise un site : le serveur central, ou son agent local.
+   *
+   * On recharge la liste depuis le serveur au lieu de modifier l'état
+   * local : c'est le serveur qui fait foi, et une base non migrée renvoie
+   * un 409 explicite qu'il faut afficher plutôt que d'ignorer.
+   */
+  async function basculerSupervision(idSite, parAgent) {
+    setModeEnCours(idSite);
+    setErreur(null);
+    try {
+      await axios.patch(`${API_URL}/sites/${idSite}/supervision`, {
+        supervision_par_agent: parAgent,
+      });
+      rafraichir();
+    } catch (err) {
+      setErreur(
+        err.response?.data?.aide ||
+          err.response?.data?.error ||
+          "Changement de mode de supervision impossible"
+      );
+    } finally {
+      setModeEnCours(null);
+    }
+  }
+
+  /**
+   * Supprime un site, sans écran intermédiaire.
+   *
+   * ── CE QUI EST DIT, ET QUAND ──
+   *
+   * Plus rien n'est demandé AVANT. Le bilan arrive APRÈS, en chiffres :
+   * il ne sert plus à obtenir une autorisation, il sert à ce qu'on sache
+   * ce qu'on vient d'effacer.
+   *
+   * Et quand le serveur refuse — dernier site, comptes rattachés — on
+   * répète SA raison. Ces deux refus ne protègent pas du clic maladroit :
+   * ils empêchent la plateforme de se retrouver dans un état faux.
+   */
+  async function supprimerSite(site) {
+    setMessage(null);
+    setErreurChargement(null);
+    setSuppressionEnCours(site.id_site);
+    try {
+      const { data } = await axios.delete(`${API_URL}/sites/${site.id_site}`);
+      setMessage(
+        `Site « ${data.site.nom} » supprimé — ` +
+          `${data.perdu.equipements ?? 0} équipement(s) et ` +
+          `${(data.perdu.releves ?? 0).toLocaleString("fr-FR")} relevé(s) effacés avec lui.`
+      );
+      await charger();
+      /* L'EN-TÊTE EST PRÉVENU, et pas seulement cette page. Sans ça, le
+         nom du site effacé reste dans le sélecteur — et, plus grave,
+         `idSite` continue de le désigner : tous les écrans filtrent sur
+         un site qui n'existe plus et deviennent vides ensemble, sans
+         qu'une ligne dise pourquoi. */
+      onSitesModifies?.();
+    } catch (err) {
+      const corps = err.response?.data;
+      const comptes = corps?.comptes?.map((c) => c.email).join(", ");
+      setErreurChargement(
+        [corps?.error, corps?.aide, comptes && `Comptes : ${comptes}`]
+          .filter(Boolean)
+          .join(" ")
+      );
+    } finally {
+      setSuppressionEnCours(null);
+    }
+  }
+
+  function rafraichir() {
+    setErreurChargement(null);
+    charger().catch((err) => setErreurChargement(decrireErreur(err, "Les sites")));
+  }
+
+  useEffect(() => { rafraichir(); }, []);
+
+  async function ajouter(e) {
+    e.preventDefault();
+    setErreur(null);
+    try {
+      const { data } = await axios.post(`${API_URL}/sites`, { nom, ville });
+      setMiseEnService(data.id_site);
+      setNom(""); setVille("");
+      await charger();
+      // Le site nouvellement créé doit apparaître dans le sélecteur
+      // immédiatement : sinon on ne peut pas s'y rendre sans recharger.
+      onSitesModifies?.();
+    } catch (err) {
+      setErreur(err.response?.data?.error || "Impossible de créer le site");
+    }
+  }
+
+  return (
+    <div className="space-y-5">
+      <div>
+        <h1 className="font-[var(--font-display)] text-xl font-semibold">Sites</h1>
+        <p className="text-sm text-[var(--color-mute)] mt-0.5">Agences supervisées</p>
+      </div>
+
+      {erreurChargement && (
+        <div className="bg-[var(--color-surface)] border rounded-xl p-4"
+             style={{ borderColor: "var(--color-crit)" }}>
+          <p className="text-sm font-medium" style={{ color: "var(--color-crit)" }}>
+            {erreurChargement.titre}
+          </p>
+          <p className="text-sm text-[var(--color-mute)] mt-1">{erreurChargement.detail}</p>
+          <button
+            onClick={rafraichir}
+            className="mt-3 text-xs px-3 py-1.5 rounded-lg border border-[var(--color-line)] text-[var(--color-mute)] hover:border-[var(--color-signal)] hover:text-[var(--color-signal)] transition"
+          >
+            Réessayer
+          </button>
+        </div>
+      )}
+
+      {/* ── LA LIMITE SE DIT, ELLE NE SE CACHE PAS ──
+
+          Faire disparaître le formulaire sans explication laisserait
+          croire à un défaut. On le remplace par ce que la fonction
+          FERAIT, et par la raison pour laquelle elle est indisponible :
+          c'est plus honnête, et c'est la meilleure vitrine possible.
+
+          Les sites déjà créés ne sont pas touchés. */}
+      <form onSubmit={ajouter} className="bg-[var(--color-surface)] border border-[var(--color-line)] rounded-xl p-5 flex flex-wrap items-end gap-3">
+        <div>
+          <label className="block text-[11px] text-[var(--color-mute)] mb-1.5">Nom du site</label>
+          <input value={nom} onChange={(e) => setNom(e.target.value)} required
+            className="bg-[var(--color-surface-2)] border border-[var(--color-line)] rounded-lg px-3 py-2 text-sm outline-none focus:border-[var(--color-signal)] transition" />
+        </div>
+        <div>
+          <label className="block text-[11px] text-[var(--color-mute)] mb-1.5">Ville</label>
+          <input value={ville} onChange={(e) => setVille(e.target.value)} required
+            className="bg-[var(--color-surface-2)] border border-[var(--color-line)] rounded-lg px-3 py-2 text-sm outline-none focus:border-[var(--color-signal)] transition" />
+        </div>
+        <button type="submit" className="bg-[var(--color-signal)] text-[var(--color-sur-accent)] font-semibold text-sm rounded-lg px-4 py-2 hover:brightness-110 transition">
+          Ajouter le site
+        </button>
+      </form>
+
+      {erreur && <p className="text-sm text-[var(--color-crit)]">{erreur}</p>}
+
+      {message && (
+        <p className="text-sm text-[var(--color-mute)]">{message}</p>
+      )}
+
+      {miseEnService && (
+        <MiseEnServiceAgent
+          idSite={miseEnService}
+          onFermer={() => {
+            setMiseEnService(null);
+            rafraichir();
+          }}
+        />
+      )}
+
+      <div className="bg-[var(--color-surface)] border border-[var(--color-line)] rounded-xl p-5">
+        <div className="table-scroll"><table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-[11px] uppercase tracking-wide text-[var(--color-mute)] border-b border-[var(--color-line)]">
+              <th className="pb-2 font-medium">Nom</th>
+              <th className="pb-2 font-medium">Ville</th>
+              <th className="pb-2 font-medium">Agent</th>
+              <th className="pb-2 font-medium">Supervisé par</th>
+              <th className="pb-2 font-medium text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-[var(--color-line)]">
+            {sites.map((s) => {
+              const etat = s.agent?.etat || "jamais_connecte";
+              const couleur =
+                etat === "actif"
+                  ? "var(--color-ok)"
+                  : etat === "muet"
+                  ? "var(--color-crit)"
+                  : "var(--color-mute)";
+              return (
+                <tr key={s.id_site}>
+                  <td className="py-2.5">{s.nom}</td>
+                  <td className="py-2.5 text-[var(--color-mute)]">{s.ville}</td>
+                  <td className="py-2.5">
+                    <span className="inline-flex items-center gap-1.5 text-xs" style={{ color: couleur }}>
+                      <span
+                        className="w-1.5 h-1.5 rounded-full shrink-0"
+                        style={{ background: couleur }}
+                      />
+                      {s.agent?.libelle || "Jamais connecté"}
+                    </span>
+                  </td>
+                  {/* QUI SUPERVISE CE SITE.
+                      Ce mode était DÉDUIT du dernier envoi d'un agent : lancer
+                      un agent une fois, pour un essai, sortait un site local de
+                      la supervision pour de bon, sans que rien ne l'affiche.
+                      Il est désormais déclaré, visible, et réversible d'un clic. */}
+                  <td className="py-2.5">
+                    <label className="inline-flex items-center gap-2 text-xs cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(s.supervision_par_agent)}
+                        disabled={modeEnCours === s.id_site}
+                        onChange={(e) => basculerSupervision(s.id_site, e.target.checked)}
+                      />
+                      <span className="text-[var(--color-mute)]">
+                        {s.supervision_par_agent ? "agent local" : "serveur central"}
+                      </span>
+                    </label>
+                  </td>
+                  <td className="py-2.5 text-right">
+                    <button
+                      onClick={() => setMiseEnService(s.id_site)}
+                      className="text-xs px-3 py-1.5 rounded-lg border border-[var(--color-line)] text-[var(--color-mute)] hover:border-[var(--color-signal)] hover:text-[var(--color-signal)] transition"
+                    >
+                      {etat === "jamais_connecte" ? "Mettre en service" : "Agent"}
+                    </button>
+
+                    {/* Suppression directe, et en dernier dans la ligne :
+                        le bouton le plus destructeur ne se met pas là où
+                        le pouce arrive en premier. */}
+                    <button
+                      onClick={() => supprimerSite(s)}
+                      disabled={suppressionEnCours === s.id_site}
+                      className="ml-2 text-xs px-3 py-1.5 rounded-lg border border-[var(--color-line)] text-[var(--color-mute)] hover:border-[var(--color-crit)] hover:text-[var(--color-crit)] transition cible-tactile disabled:opacity-40"
+                    >
+                      {suppressionEnCours === s.id_site ? "Suppression…" : "Supprimer"}
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table></div>
+      </div>
+    </div>
+  );
+}
